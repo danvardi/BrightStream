@@ -1,0 +1,53 @@
+﻿<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BrightStream Settings</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="options">
+  <main>
+    <h1>BrightStream Settings</h1>
+
+    <section>
+      <label for="mode">Whitelist mode</label>
+      <select id="mode">
+        <option value="strict">Strict (channel ID only)</option>
+        <option value="lenient">Lenient (channel ID or handle)</option>
+      </select>
+    </section>
+
+    <section>
+      <label>
+        <input type="checkbox" id="blockShorts" />
+        Block Shorts completely
+      </label>
+      <label>
+        <input type="checkbox" id="enforceWatchGuard" />
+        Block non-whitelisted watch pages
+      </label>
+    </section>
+
+    <section>
+      <label for="channelIds">Whitelisted channel IDs (one per line)</label>
+      <textarea id="channelIds" rows="8" placeholder="UCxxxxxxxx"></textarea>
+    </section>
+
+    <section>
+      <label for="handles">Whitelisted handles (one per line)</label>
+      <textarea id="handles" rows="8" placeholder="@channelhandle"></textarea>
+    </section>
+
+    <section class="inline-actions">
+      <button id="saveBtn">Save</button>
+      <button id="exportBtn">Export JSON</button>
+      <button id="importBtn">Import JSON</button>
+      <input type="file" id="importFile" accept="application/json" hidden />
+    </section>
+
+    <p id="status" aria-live="polite"></p>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>
