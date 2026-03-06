@@ -314,6 +314,14 @@
     return TILE_SELECTORS.includes(el.tagName.toLowerCase());
   }
 
+  function isRecommendationTile(tile) {
+    if (!tile || !(tile instanceof HTMLElement)) return false;
+    return Boolean(
+      tile.closest("#secondary, #related, ytd-watch-next-secondary-results-renderer") ||
+      tile.closest("ytd-player ytd-endscreen")
+    );
+  }
+
   function tryWhitelistFromTile(tile, next) {
     const identity = resolveTileIdentity(tile);
     if (!identity) return false;
@@ -342,6 +350,19 @@
       return;
     }
 
+    const recommendationMode = Boolean(options.recommendation || isRecommendationTile(tile));
+    if (recommendationMode) {
+      const directIdentity = extractIdentityFromUrl(getChannelLinkFromTile(tile));
+      if (directIdentity && (directIdentity.channelId || directIdentity.handle)) {
+        if (!isWhitelisted(directIdentity)) {
+          removeNode(tile);
+        }
+      } else {
+        resolveRecommendationTileIdentity(tile);
+      }
+      return;
+    }
+
     const identity = resolveTileIdentity(tile);
     if (!identity) {
       if (options.resolveFromVideo) {
@@ -357,7 +378,12 @@
 
   function filterExistingTiles(root = document, options = {}) {
     const nodes = root.querySelectorAll(TILE_SELECTORS.join(","));
-    nodes.forEach((tile) => filterTile(tile, options));
+    nodes.forEach((tile) => {
+      if (options.excludeRecommendations && isRecommendationTile(tile)) {
+        return;
+      }
+      filterTile(tile, options);
+    });
   }
 
   async function bootstrapSubscriptionsWhitelist() {
@@ -423,7 +449,7 @@
 
     for (const selector of recommendationSelectors) {
       document.querySelectorAll(selector).forEach((tile) => {
-        filterTile(tile, { resolveFromVideo: true });
+        filterTile(tile, { recommendation: true, resolveFromVideo: true });
       });
     }
   }
@@ -488,15 +514,15 @@
           if (!(node instanceof HTMLElement)) return;
 
           if (shouldTreatAsVideoTile(node)) {
-            filterTile(node, { skipWhitelist });
+            filterTile(node, { skipWhitelist, excludeRecommendations: isWatchPage() });
           }
 
           const closestTile = node.closest ? node.closest(TILE_SELECTORS.join(",")) : null;
           if (closestTile instanceof HTMLElement) {
-            filterTile(closestTile, { skipWhitelist });
+            filterTile(closestTile, { skipWhitelist, excludeRecommendations: isWatchPage() });
           }
 
-          filterExistingTiles(node, { skipWhitelist });
+          filterExistingTiles(node, { skipWhitelist, excludeRecommendations: isWatchPage() });
         });
       }
 
@@ -528,7 +554,7 @@
     const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
 
     scheduleWatchGuard();
-    filterExistingTiles(document, { skipWhitelist });
+    filterExistingTiles(document, { skipWhitelist, excludeRecommendations: isWatchPage() });
     scheduleSubscriptionsBootstrap();
     forceFilterRecommendations();
   }
@@ -597,5 +623,9 @@
     getCurrentPageIdentity
   };
 })();
+
+
+
+
 
 
