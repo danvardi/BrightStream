@@ -266,9 +266,29 @@
 
     const recommendationSelectors = [
       "#secondary ytd-compact-video-renderer",
+      "#secondary ytd-compact-radio-renderer",
+      "#secondary ytd-compact-playlist-renderer",
+      "#secondary ytd-compact-movie-renderer",
+      "#secondary ytd-video-renderer",
+      "#secondary ytd-rich-item-renderer",
+      "#secondary ytd-lockup-view-model",
+      "#secondary yt-lockup-view-model",
       "#related ytd-compact-video-renderer",
-      "#items ytd-compact-video-renderer",
+      "#related ytd-compact-radio-renderer",
+      "#related ytd-compact-playlist-renderer",
+      "#related ytd-compact-movie-renderer",
+      "#related ytd-video-renderer",
+      "#related ytd-rich-item-renderer",
+      "#related ytd-lockup-view-model",
+      "#related yt-lockup-view-model",
       "ytd-watch-next-secondary-results-renderer ytd-compact-video-renderer",
+      "ytd-watch-next-secondary-results-renderer ytd-compact-radio-renderer",
+      "ytd-watch-next-secondary-results-renderer ytd-compact-playlist-renderer",
+      "ytd-watch-next-secondary-results-renderer ytd-compact-movie-renderer",
+      "ytd-watch-next-secondary-results-renderer ytd-video-renderer",
+      "ytd-watch-next-secondary-results-renderer ytd-rich-item-renderer",
+      "ytd-watch-next-secondary-results-renderer ytd-lockup-view-model",
+      "ytd-watch-next-secondary-results-renderer yt-lockup-view-model",
       "ytd-player ytd-endscreen ytd-end-screen-video-renderer"
     ];
 
@@ -425,3 +445,4 @@
     getCurrentPageIdentity
   };
 })();
+
