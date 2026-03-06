@@ -84,7 +84,9 @@
   function shouldBlockByPath() {
     const path = getPathname();
     if (!settings.blockShorts) return false;
-    return path === "/shorts" || path.startsWith("/shorts/");
+    const isShortsPath = path === "/shorts" || path.startsWith("/shorts/");
+    const isSubscriptionsShorts = path === "/feed/subscriptions/shorts" || path.startsWith("/feed/subscriptions/shorts/");
+    return isShortsPath || isSubscriptionsShorts;
   }
 
   function redirectToSubscriptions() {
@@ -98,6 +100,18 @@
     const channelIdAllowed = Boolean(identity.channelId && settings.channelIds.includes(identity.channelId));
     const handleAllowed = Boolean(identity.handle && settings.handles.includes(identity.handle));
     return settings.mode === "strict" ? channelIdAllowed : (channelIdAllowed || handleAllowed);
+  }
+
+  function isWhitelistedForWatchGuard(identity) {
+    if (!identity) return false;
+    if (isWhitelisted(identity)) return true;
+
+    // Guard against false blocks when YouTube only exposes handle on watch metadata.
+    if (settings.whitelistSubscriptionsByDefault && identity.handle) {
+      return settings.handles.includes(identity.handle);
+    }
+
+    return false;
   }
 
   function extractIdentityFromUrl(urlValue) {
@@ -274,7 +288,7 @@
     const identity = extractCurrentWatchIdentity();
 
     if (!identity) return;
-    if (!isWhitelisted(identity)) {
+    if (!isWhitelistedForWatchGuard(identity)) {
       log("Blocking watch page for non-whitelisted channel", identity);
       redirectToSubscriptions();
     }
@@ -406,3 +420,7 @@
     getCurrentPageIdentity
   };
 })();
+
+
+
+
