@@ -68,25 +68,53 @@
     }
   }
 
+  function findAnchorFromEvent(event) {
+    return event.target instanceof Element ? event.target.closest("a[href]") : null;
+  }
+
+  function blockShortsNavFromEvent(event) {
+    const anchor = findAnchorFromEvent(event);
+    if (!anchor) return;
+
+    const href = anchor.getAttribute("href") || "";
+    if (!hrefTargetsBlockedShorts(href)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") {
+      event.stopImmediatePropagation();
+    }
+    ensureShortsHidden();
+    window.location.replace(SUBS_URL);
+  }
+
   enforce();
   wrapHistory("pushState");
   wrapHistory("replaceState");
 
-  window.addEventListener("yt-navigate-start", enforce, true);
+  window.addEventListener("yt-navigate-start", (event) => {
+    const url = event?.detail?.url || "";
+    if (hrefTargetsBlockedShorts(url)) {
+      event.preventDefault?.();
+      ensureShortsHidden();
+      window.location.replace(SUBS_URL);
+      return;
+    }
+    enforce();
+  }, true);
+
   window.addEventListener("popstate", enforce, true);
   window.addEventListener("hashchange", enforce, true);
 
-  // Prevent in-page Shorts navigation so playback never starts.
-  document.addEventListener("click", (event) => {
-    const target = event.target instanceof Element ? event.target.closest("a[href]") : null;
-    if (!target) return;
+  // Intercept as early as possible to avoid Shorts first frame.
+  document.addEventListener("pointerdown", blockShortsNavFromEvent, true);
+  document.addEventListener("mousedown", blockShortsNavFromEvent, true);
+  document.addEventListener("touchstart", blockShortsNavFromEvent, true);
+  document.addEventListener("click", blockShortsNavFromEvent, true);
+  document.addEventListener("auxclick", blockShortsNavFromEvent, true);
 
-    const href = target.getAttribute("href") || "";
-    if (hrefTargetsBlockedShorts(href)) {
-      event.preventDefault();
-      event.stopPropagation();
-      ensureShortsHidden();
-      window.location.replace(SUBS_URL);
-    }
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    blockShortsNavFromEvent(event);
   }, true);
 })();

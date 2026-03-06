@@ -213,7 +213,10 @@
 
     const channelHref = getChannelLinkFromTile(tile);
     if (!channelHref) {
-      // Keep unresolved items until channel metadata is hydrated.
+      // For watch recommendations, fail closed so unknown channels never remain visible.
+      if (options.removeIfUnresolved) {
+        removeNode(tile);
+      }
       return;
     }
 
@@ -270,7 +273,9 @@
     ];
 
     for (const selector of recommendationSelectors) {
-      document.querySelectorAll(selector).forEach((tile) => filterTile(tile));
+      document.querySelectorAll(selector).forEach((tile) => {
+        filterTile(tile, { removeIfUnresolved: true });
+      });
     }
   }
 
@@ -420,7 +425,3 @@
     getCurrentPageIdentity
   };
 })();
-
-
-
-
