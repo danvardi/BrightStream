@@ -31,6 +31,8 @@
   let watchGuardTimer = null;
   let bootstrapTimer = null;
   let recommendationsTicker = null;
+  const recommendationIdentityCache = new Map();
+  const recommendationResolveInFlight = new Set();
 
   function log(...args) {
     if (settings.debug) {
@@ -215,6 +217,71 @@
     return extractIdentityFromTileData(tile);
   }
 
+  function getVideoLinkFromTile(tile) {
+    if (!tile) return "";
+    const selectors = [
+      "a#thumbnail[href*='\/watch']",
+      "a.yt-simple-endpoint[href*='\/watch']",
+      "a[href*='\/watch?v=']"
+    ];
+
+    for (const selector of selectors) {
+      const link = tile.querySelector(selector);
+      const href = link?.getAttribute("href") || "";
+      if (href) return href;
+    }
+    return "";
+  }
+
+  function extractVideoIdFromHref(href) {
+    if (!href) return "";
+    try {
+      const url = new URL(href, window.location.origin);
+      return url.searchParams.get("v") || "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function fetchIdentityForVideoId(videoId) {
+    if (!videoId) return null;
+    if (recommendationIdentityCache.has(videoId)) {
+      return recommendationIdentityCache.get(videoId);
+    }
+
+    const watchUrl = `${window.location.origin}/watch?v=${encodeURIComponent(videoId)}`;
+    const oembedUrl = `${window.location.origin}/oembed?url=${encodeURIComponent(watchUrl)}&format=json`;
+    const response = await fetch(oembedUrl, { credentials: "same-origin" });
+    if (!response.ok) return null;
+
+    const payload = await response.json();
+    const authorUrl = payload?.author_url || "";
+    const identity = extractIdentityFromUrl(authorUrl);
+    if (!identity || (!identity.channelId && !identity.handle)) return null;
+
+    recommendationIdentityCache.set(videoId, identity);
+    return identity;
+  }
+
+  function resolveRecommendationTileIdentity(tile) {
+    const href = getVideoLinkFromTile(tile);
+    const videoId = extractVideoIdFromHref(href);
+    if (!videoId || recommendationResolveInFlight.has(videoId)) return;
+
+    recommendationResolveInFlight.add(videoId);
+    fetchIdentityForVideoId(videoId)
+      .then((identity) => {
+        if (!identity) return;
+        if (tile.isConnected && !isWhitelistedForRecommendations(identity)) {
+          removeNode(tile);
+        }
+      })
+      .catch((err) => log("Recommendation resolve failed", err))
+      .finally(() => {
+        recommendationResolveInFlight.delete(videoId);
+      });
+  }
+
   function removeNode(node) {
     if (!node || !node.isConnected) return;
     node.remove();
@@ -278,6 +345,7 @@
     if (recommendationMode) {
       const identity = resolveTileIdentity(tile);
       if (!identity) {
+        resolveRecommendationTileIdentity(tile);
         return;
       }
       if (!isWhitelistedForRecommendations(identity)) {
