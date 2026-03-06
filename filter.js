@@ -102,7 +102,13 @@
     if (!identity) return false;
     const channelIdAllowed = Boolean(identity.channelId && settings.channelIds.includes(identity.channelId));
     const handleAllowed = Boolean(identity.handle && settings.handles.includes(identity.handle));
-    return settings.mode === "strict" ? channelIdAllowed : (channelIdAllowed || handleAllowed);
+
+    // In strict mode, if channelId is not available yet, allow handle match to avoid false removals.
+    if (settings.mode === "strict") {
+      return channelIdAllowed || (!identity.channelId && handleAllowed);
+    }
+
+    return channelIdAllowed || handleAllowed;
   }
 
   function isWhitelistedForWatchGuard(identity) {
@@ -244,11 +250,20 @@
     if (!response.ok) return null;
 
     const text = await response.text();
-    const channelIdMatch = text.match(/"channelId":"(UC[^"]+)"/);
-    const canonicalBaseUrlMatch = text.match(/"canonicalBaseUrl":"\\\/@([^"\\]+)"/);
 
-    const channelId = normalizeChannelId(channelIdMatch?.[1] || "");
-    const handle = normalizeHandle(canonicalBaseUrlMatch?.[1] ? `@${canonicalBaseUrlMatch[1]}` : "");
+    // Anchor extraction to the exact videoId block to avoid matching unrelated channel IDs.
+    const escapedVideoId = videoId.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&");
+    const detailsRegex = new RegExp(`"videoDetails":\\{[^}]*"videoId":"${escapedVideoId}"[^}]*"channelId":"(UC[^\"]+)"`);
+    const videoDetailsMatch = text.match(detailsRegex);
+
+    const channelId = normalizeChannelId(videoDetailsMatch?.[1] || "");
+
+    // Handle is optional fallback; if unavailable we keep the tile instead of false-blocking.
+    let handle = "";
+    if (!channelId) {
+      const canonicalBaseUrlMatch = text.match(/"canonicalBaseUrl":"\\\/@([^"\\]+)"/);
+      handle = normalizeHandle(canonicalBaseUrlMatch?.[1] ? `@${canonicalBaseUrlMatch[1]}` : "");
+    }
 
     if (!channelId && !handle) return null;
 
@@ -582,3 +597,5 @@
     getCurrentPageIdentity
   };
 })();
+
+
