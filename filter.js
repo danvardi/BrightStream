@@ -1,5 +1,18 @@
 ﻿(() => {
   const SETTINGS_KEY = "ytWhitelistSettings";
+  const SUBS_URL = "https://www.youtube.com/feed/subscriptions";
+  const TILE_SELECTORS = [
+    "ytd-rich-item-renderer",
+    "ytd-video-renderer",
+    "ytd-compact-video-renderer",
+    "ytd-grid-video-renderer",
+    "ytd-playlist-video-renderer",
+    "ytd-compact-radio-renderer",
+    "ytd-compact-playlist-renderer",
+    "ytd-reel-shelf-renderer",
+    "ytd-reel-item-renderer"
+  ];
+
   const DEFAULTS = {
     version: 2,
     mode: "strict",
@@ -7,6 +20,7 @@
     handles: [],
     blockShorts: true,
     enforceWatchGuard: true,
+    whitelistSubscriptionsByDefault: true,
     parentLockEnabled: false,
     pinHash: "",
     debug: false
@@ -15,6 +29,7 @@
   let settings = { ...DEFAULTS };
   let observer = null;
   let watchGuardTimer = null;
+  let bootstrapTimer = null;
 
   function log(...args) {
     if (settings.debug) {
@@ -39,6 +54,7 @@
     merged.channelIds = [...new Set((merged.channelIds || []).map(normalizeChannelId).filter(Boolean))];
     merged.handles = [...new Set((merged.handles || []).map(normalizeHandle).filter(Boolean))];
     merged.mode = merged.mode === "lenient" ? "lenient" : "strict";
+    merged.whitelistSubscriptionsByDefault = merged.whitelistSubscriptionsByDefault !== false;
     return merged;
   }
 
@@ -61,15 +77,19 @@
     return getPathname() === "/watch";
   }
 
+  function isSubscriptionsPage() {
+    return getPathname().startsWith("/feed/subscriptions");
+  }
+
   function shouldBlockByPath() {
     const path = getPathname();
-    return settings.blockShorts && path.startsWith("/shorts/");
+    if (!settings.blockShorts) return false;
+    return path === "/shorts" || path.startsWith("/shorts/");
   }
 
   function redirectToSubscriptions() {
-    const target = "https://www.youtube.com/feed/subscriptions";
-    if (window.location.href !== target) {
-      window.location.replace(target);
+    if (window.location.href !== SUBS_URL) {
+      window.location.replace(SUBS_URL);
     }
   }
 
@@ -101,10 +121,7 @@
       handle = normalizeHandle(segments[0]);
     }
 
-    return {
-      channelId,
-      handle
-    };
+    return { channelId, handle };
   }
 
   function getChannelLinkFromTile(tile) {
@@ -135,10 +152,11 @@
 
   function isShortsTile(tile) {
     if (!settings.blockShorts) return false;
+
     const links = tile.querySelectorAll("a[href]");
     for (const link of links) {
       const href = link.getAttribute("href") || "";
-      if (href.includes("/shorts/")) return true;
+      if (href.includes("/shorts/") || href === "/shorts") return true;
     }
 
     const text = (tile.textContent || "").toLowerCase();
@@ -147,22 +165,27 @@
 
   function shouldTreatAsVideoTile(el) {
     if (!el || !(el instanceof HTMLElement)) return false;
-    const tag = el.tagName.toLowerCase();
-    return [
-      "ytd-rich-item-renderer",
-      "ytd-video-renderer",
-      "ytd-compact-video-renderer",
-      "ytd-grid-video-renderer",
-      "ytd-playlist-video-renderer",
-      "ytd-reel-shelf-renderer",
-      "ytd-reel-item-renderer",
-      "ytd-rich-shelf-renderer",
-      "ytd-compact-radio-renderer",
-      "ytd-compact-playlist-renderer"
-    ].includes(tag);
+    return TILE_SELECTORS.includes(el.tagName.toLowerCase());
   }
 
-  function filterTile(tile) {
+  function tryWhitelistFromTile(tile, next) {
+    const channelHref = getChannelLinkFromTile(tile);
+    const identity = extractIdentityFromUrl(channelHref);
+    if (!identity) return false;
+
+    let changed = false;
+    if (identity.channelId && !next.channelIds.includes(identity.channelId)) {
+      next.channelIds.push(identity.channelId);
+      changed = true;
+    }
+    if (identity.handle && !next.handles.includes(identity.handle)) {
+      next.handles.push(identity.handle);
+      changed = true;
+    }
+    return changed;
+  }
+
+  function filterTile(tile, options = {}) {
     if (!tile || !tile.isConnected) return;
 
     if (isShortsTile(tile)) {
@@ -170,29 +193,55 @@
       return;
     }
 
-    const channelHref = getChannelLinkFromTile(tile);
-    const identity = extractIdentityFromUrl(channelHref);
+    if (options.skipWhitelist) {
+      return;
+    }
 
+    const channelHref = getChannelLinkFromTile(tile);
+    if (!channelHref) {
+      // Keep unresolved items until channel metadata is hydrated.
+      return;
+    }
+
+    const identity = extractIdentityFromUrl(channelHref);
     if (!isWhitelisted(identity)) {
       removeNode(tile);
     }
   }
 
-  function filterExistingTiles(root = document) {
-    const selectors = [
-      "ytd-rich-item-renderer",
-      "ytd-video-renderer",
-      "ytd-compact-video-renderer",
-      "ytd-grid-video-renderer",
-      "ytd-playlist-video-renderer",
-      "ytd-compact-radio-renderer",
-      "ytd-compact-playlist-renderer",
-      "ytd-reel-shelf-renderer",
-      "ytd-reel-item-renderer"
-    ];
+  function filterExistingTiles(root = document, options = {}) {
+    const nodes = root.querySelectorAll(TILE_SELECTORS.join(","));
+    nodes.forEach((tile) => filterTile(tile, options));
+  }
 
-    const nodes = root.querySelectorAll(selectors.join(","));
-    nodes.forEach(filterTile);
+  async function bootstrapSubscriptionsWhitelist() {
+    if (!settings.whitelistSubscriptionsByDefault || !isSubscriptionsPage()) return;
+
+    const next = {
+      ...settings,
+      channelIds: [...settings.channelIds],
+      handles: [...settings.handles]
+    };
+
+    let changed = false;
+    document.querySelectorAll(TILE_SELECTORS.join(",")).forEach((tile) => {
+      changed = tryWhitelistFromTile(tile, next) || changed;
+    });
+
+    if (changed) {
+      await saveSettings(next);
+      log("Bootstrapped whitelist from subscriptions feed");
+    }
+  }
+
+  function scheduleSubscriptionsBootstrap() {
+    if (!settings.whitelistSubscriptionsByDefault || !isSubscriptionsPage()) return;
+    if (bootstrapTimer) clearTimeout(bootstrapTimer);
+    bootstrapTimer = setTimeout(() => {
+      bootstrapSubscriptionsWhitelist().catch((err) => {
+        console.error("[BrightStream] bootstrap failed", err);
+      });
+    }, 300);
   }
 
   function forceFilterRecommendations() {
@@ -207,7 +256,7 @@
     ];
 
     for (const selector of recommendationSelectors) {
-      document.querySelectorAll(selector).forEach(filterTile);
+      document.querySelectorAll(selector).forEach((tile) => filterTile(tile));
     }
   }
 
@@ -247,17 +296,26 @@
     }
 
     observer = new MutationObserver((mutations) => {
+      const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
+
       for (const mutation of mutations) {
         mutation.addedNodes.forEach((node) => {
           if (!(node instanceof HTMLElement)) return;
 
           if (shouldTreatAsVideoTile(node)) {
-            filterTile(node);
+            filterTile(node, { skipWhitelist });
           }
 
-          filterExistingTiles(node);
+          const closestTile = node.closest ? node.closest(TILE_SELECTORS.join(",")) : null;
+          if (closestTile instanceof HTMLElement) {
+            filterTile(closestTile, { skipWhitelist });
+          }
+
+          filterExistingTiles(node, { skipWhitelist });
         });
       }
+
+      scheduleSubscriptionsBootstrap();
 
       if (isWatchPage()) {
         forceFilterRecommendations();
@@ -276,8 +334,11 @@
       return;
     }
 
+    const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
+
     scheduleWatchGuard();
-    filterExistingTiles(document);
+    filterExistingTiles(document, { skipWhitelist });
+    scheduleSubscriptionsBootstrap();
     forceFilterRecommendations();
   }
 

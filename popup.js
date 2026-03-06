@@ -7,6 +7,7 @@
     handles: [],
     blockShorts: true,
     enforceWatchGuard: true,
+    whitelistSubscriptionsByDefault: true,
     parentLockEnabled: false,
     pinHash: "",
     debug: false
@@ -32,6 +33,7 @@
     merged.channelIds = [...new Set((merged.channelIds || []).map((x) => (x || "").trim()).filter(Boolean))];
     merged.handles = [...new Set((merged.handles || []).map(normalizeHandle).filter(Boolean))];
     merged.mode = merged.mode === "lenient" ? "lenient" : "strict";
+    merged.whitelistSubscriptionsByDefault = merged.whitelistSubscriptionsByDefault !== false;
     return merged;
   }
 

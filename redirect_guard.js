@@ -8,7 +8,7 @@
   function shouldRedirectToSubs(url) {
     const path = normalizePath(url.pathname);
     const isRoot = path === "" || path === "/";
-    const isShorts = path.startsWith("/shorts/");
+    const isShorts = path === "/shorts" || path.startsWith("/shorts/");
     return isRoot || isShorts;
   }
 
@@ -21,4 +21,17 @@
 
   enforce();
   window.addEventListener("yt-navigate-start", enforce, true);
+
+  // Prevent in-page Shorts navigation so playback never starts.
+  document.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("a[href]") : null;
+    if (!target) return;
+
+    const href = target.getAttribute("href") || "";
+    if (href === "/shorts" || href.startsWith("/shorts/")) {
+      event.preventDefault();
+      event.stopPropagation();
+      window.location.replace(SUBS_URL);
+    }
+  }, true);
 })();

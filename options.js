@@ -7,6 +7,7 @@
     handles: [],
     blockShorts: true,
     enforceWatchGuard: true,
+    whitelistSubscriptionsByDefault: true,
     parentLockEnabled: false,
     pinHash: "",
     debug: false
@@ -15,6 +16,7 @@
   const modeEl = document.getElementById("mode");
   const blockShortsEl = document.getElementById("blockShorts");
   const enforceWatchGuardEl = document.getElementById("enforceWatchGuard");
+  const whitelistSubscriptionsEl = document.getElementById("whitelistSubscriptionsByDefault");
   const channelIdsEl = document.getElementById("channelIds");
   const handlesEl = document.getElementById("handles");
   const statusEl = document.getElementById("status");
@@ -31,6 +33,7 @@
     merged.channelIds = [...new Set((merged.channelIds || []).map((x) => (x || "").trim()).filter(Boolean))];
     merged.handles = [...new Set((merged.handles || []).map(normalizeHandle).filter(Boolean))];
     merged.mode = merged.mode === "lenient" ? "lenient" : "strict";
+    merged.whitelistSubscriptionsByDefault = merged.whitelistSubscriptionsByDefault !== false;
     return merged;
   }
 
@@ -61,6 +64,7 @@
     modeEl.value = settings.mode;
     blockShortsEl.checked = settings.blockShorts;
     enforceWatchGuardEl.checked = settings.enforceWatchGuard;
+    whitelistSubscriptionsEl.checked = settings.whitelistSubscriptionsByDefault;
     channelIdsEl.value = settings.channelIds.join("\n");
     handlesEl.value = settings.handles.join("\n");
   }
@@ -71,6 +75,7 @@
       mode: modeEl.value,
       blockShorts: blockShortsEl.checked,
       enforceWatchGuard: enforceWatchGuardEl.checked,
+      whitelistSubscriptionsByDefault: whitelistSubscriptionsEl.checked,
       channelIds: parseLines(channelIdsEl.value, (x) => x),
       handles: parseLines(handlesEl.value, normalizeHandle)
     });
