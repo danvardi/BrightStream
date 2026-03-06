@@ -31,8 +31,6 @@
   let watchGuardTimer = null;
   let bootstrapTimer = null;
   let recommendationsTicker = null;
-  const recommendationIdentityCache = new Map();
-  const recommendationResolveInFlight = new Set();
 
   function log(...args) {
     if (settings.debug) {
@@ -217,90 +215,9 @@
     return extractIdentityFromTileData(tile);
   }
 
-  function getVideoLinkFromTile(tile) {
-    if (!tile) return "";
-
-    const selectors = [
-      "a#thumbnail[href*='/watch']",
-      "a.yt-simple-endpoint[href*='/watch']",
-      "a[href*='/watch?v=']"
-    ];
-
-    for (const selector of selectors) {
-      const link = tile.querySelector(selector);
-      const href = link?.getAttribute("href") || "";
-      if (href) return href;
-    }
-
-    return "";
-  }
-
-  function extractVideoIdFromHref(href) {
-    if (!href) return "";
-    try {
-      const url = new URL(href, window.location.origin);
-      return url.searchParams.get("v") || "";
-    } catch {
-      return "";
-    }
-  }
-
-  async function fetchIdentityForVideoId(videoId) {
-    if (!videoId) return null;
-    if (recommendationIdentityCache.has(videoId)) {
-      return recommendationIdentityCache.get(videoId);
-    }
-
-    const response = await fetch(`/watch?v=${encodeURIComponent(videoId)}`, {
-      credentials: "same-origin"
-    });
-    if (!response.ok) return null;
-
-    const text = await response.text();
-
-    // Anchor extraction to the exact videoId block to avoid matching unrelated channel IDs.
-    const escapedVideoId = videoId.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&");
-    const detailsRegex = new RegExp(`"videoDetails":\\{[^}]*"videoId":"${escapedVideoId}"[^}]*"channelId":"(UC[^\"]+)"`);
-    const videoDetailsMatch = text.match(detailsRegex);
-
-    const channelId = normalizeChannelId(videoDetailsMatch?.[1] || "");
-
-    // Handle is optional fallback; if unavailable we keep the tile instead of false-blocking.
-    let handle = "";
-    if (!channelId) {
-      const canonicalBaseUrlMatch = text.match(/"canonicalBaseUrl":"\\\/@([^"\\]+)"/);
-      handle = normalizeHandle(canonicalBaseUrlMatch?.[1] ? `@${canonicalBaseUrlMatch[1]}` : "");
-    }
-
-    if (!channelId && !handle) return null;
-
-    const identity = { channelId, handle };
-    recommendationIdentityCache.set(videoId, identity);
-    return identity;
-  }
-
   function removeNode(node) {
     if (!node || !node.isConnected) return;
     node.remove();
-  }
-
-  function resolveRecommendationTileIdentity(tile) {
-    const href = getVideoLinkFromTile(tile);
-    const videoId = extractVideoIdFromHref(href);
-    if (!videoId || recommendationResolveInFlight.has(videoId)) return;
-
-    recommendationResolveInFlight.add(videoId);
-    fetchIdentityForVideoId(videoId)
-      .then((identity) => {
-        if (!identity) return;
-        if (tile.isConnected && !isWhitelistedForRecommendations(identity)) {
-          removeNode(tile);
-        }
-      })
-      .catch((err) => log("Recommendation resolve failed", err))
-      .finally(() => {
-        recommendationResolveInFlight.delete(videoId);
-      });
   }
 
   function isShortsTile(tile) {
@@ -359,22 +276,18 @@
 
     const recommendationMode = Boolean(options.recommendation || isRecommendationTile(tile));
     if (recommendationMode) {
-      const directIdentity = extractIdentityFromUrl(getChannelLinkFromTile(tile));
-      if (directIdentity && (directIdentity.channelId || directIdentity.handle)) {
-        if (!isWhitelistedForRecommendations(directIdentity)) {
-          removeNode(tile);
-        }
-      } else {
-        resolveRecommendationTileIdentity(tile);
+      const identity = resolveTileIdentity(tile);
+      if (!identity) {
+        return;
+      }
+      if (!isWhitelistedForRecommendations(identity)) {
+        removeNode(tile);
       }
       return;
     }
 
     const identity = resolveTileIdentity(tile);
     if (!identity) {
-      if (options.resolveFromVideo) {
-        resolveRecommendationTileIdentity(tile);
-      }
       return;
     }
 
@@ -456,7 +369,7 @@
 
     for (const selector of recommendationSelectors) {
       document.querySelectorAll(selector).forEach((tile) => {
-        filterTile(tile, { recommendation: true, resolveFromVideo: true });
+        filterTile(tile, { recommendation: true });
       });
     }
   }
@@ -630,11 +543,4 @@
     getCurrentPageIdentity
   };
 })();
-
-
-
-
-
-
-
 
