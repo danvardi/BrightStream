@@ -1,6 +1,7 @@
 ﻿(() => {
   const SETTINGS_KEY = "ytWhitelistSettings";
   const SUBS_URL = "https://www.youtube.com/feed/subscriptions";
+  const WATCH_GUARD_HIDE_STYLE_ID = "brightstream-watch-guard-style";
   const TILE_SELECTORS = [
     "ytd-rich-item-renderer",
     "ytd-video-renderer",
@@ -29,6 +30,7 @@
   let settings = { ...DEFAULTS };
   let observer = null;
   let watchGuardTimer = null;
+  let watchGuardProbeToken = 0;
   let bootstrapTimer = null;
   let recommendationsTicker = null;
   const recommendationIdentityCache = new Map();
@@ -82,6 +84,30 @@
 
   function isSubscriptionsPage() {
     return getPathname().startsWith("/feed/subscriptions");
+  }
+
+  function setWatchGuardHidden(hidden) {
+    const existing = document.getElementById(WATCH_GUARD_HIDE_STYLE_ID);
+    if (hidden) {
+      if (existing) return;
+      const style = document.createElement("style");
+      style.id = WATCH_GUARD_HIDE_STYLE_ID;
+      style.textContent = "html{visibility:hidden !important;}";
+      (document.head || document.documentElement).appendChild(style);
+      return;
+    }
+
+    if (existing) {
+      existing.remove();
+    }
+  }
+
+  function getCurrentVideoIdFromLocation() {
+    try {
+      return new URL(window.location.href).searchParams.get("v") || "";
+    } catch {
+      return "";
+    }
   }
 
   function shouldBlockByPath() {
@@ -440,6 +466,36 @@
         filterTile(tile, { recommendation: true });
       });
     }
+    clearStuckRecommendationLoaders();
+  }
+
+  function clearStuckRecommendationLoaders() {
+    if (!isWatchPage()) return;
+
+    const now = Date.now();
+    const loaderSelectors = [
+      "#secondary ytd-continuation-item-renderer",
+      "#related ytd-continuation-item-renderer",
+      "#secondary tp-yt-paper-spinner",
+      "#related tp-yt-paper-spinner"
+    ];
+
+    for (const selector of loaderSelectors) {
+      document.querySelectorAll(selector).forEach((node) => {
+        const host = node.closest("ytd-continuation-item-renderer") || node;
+        if (!(host instanceof HTMLElement)) return;
+
+        if (!host.dataset.bsSeenAt) {
+          host.dataset.bsSeenAt = String(now);
+          return;
+        }
+
+        const seenAt = Number(host.dataset.bsSeenAt);
+        if (Number.isFinite(seenAt) && now - seenAt > 3500) {
+          host.remove();
+        }
+      });
+    }
   }
 
   function startRecommendationsTicker() {
@@ -468,18 +524,67 @@
     return extractIdentityFromUrl(channelLink.getAttribute("href"));
   }
 
-  function enforceWatchGuard() {
-    if (!settings.enforceWatchGuard || !isWatchPage()) return;
-    const identity = extractCurrentWatchIdentity();
+  async function resolveCurrentWatchIdentity() {
+    const direct = extractCurrentWatchIdentity();
+    if (direct && (direct.channelId || direct.handle)) {
+      return direct;
+    }
 
-    if (!identity) return;
-    if (!isWhitelistedForWatchGuard(identity)) {
-      log("Blocking watch page for non-whitelisted channel", identity);
-      redirectToSubscriptions();
+    const videoId = getCurrentVideoIdFromLocation();
+    if (!videoId) return null;
+
+    try {
+      return await fetchIdentityForVideoId(videoId);
+    } catch {
+      return null;
     }
   }
 
+  async function enforceWatchGuardFast() {
+    const probeToken = ++watchGuardProbeToken;
+
+    if (!isWatchPage() || !settings.enforceWatchGuard) {
+      setWatchGuardHidden(false);
+      return;
+    }
+
+    setWatchGuardHidden(true);
+    const identity = await resolveCurrentWatchIdentity();
+
+    if (probeToken !== watchGuardProbeToken) {
+      return;
+    }
+
+    if (identity && !isWhitelistedForWatchGuard(identity)) {
+      log("Blocking watch page (fast guard) for non-whitelisted channel", identity);
+      redirectToSubscriptions();
+      return;
+    }
+
+    setWatchGuardHidden(false);
+  }
+
+  function enforceWatchGuard() {
+    if (!settings.enforceWatchGuard || !isWatchPage()) {
+      setWatchGuardHidden(false);
+      return;
+    }
+
+    const identity = extractCurrentWatchIdentity();
+    if (!identity) return;
+
+    if (!isWhitelistedForWatchGuard(identity)) {
+      log("Blocking watch page for non-whitelisted channel", identity);
+      redirectToSubscriptions();
+      return;
+    }
+
+    setWatchGuardHidden(false);
+  }
+
   function scheduleWatchGuard() {
+    enforceWatchGuardFast().catch((err) => log("Fast watch guard failed", err));
+
     if (watchGuardTimer) {
       clearTimeout(watchGuardTimer);
     }
@@ -587,6 +692,10 @@
   });
 
   async function init() {
+    if (isWatchPage()) {
+      setWatchGuardHidden(true);
+    }
+
     await loadSettings();
 
     if (shouldBlockByPath()) {
