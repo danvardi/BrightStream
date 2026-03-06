@@ -124,6 +124,37 @@
     }
   }
 
+  function parseUrlLike(urlValue) {
+    if (!urlValue) return null;
+    try {
+      return new URL(String(urlValue), window.location.origin);
+    } catch {
+      return null;
+    }
+  }
+
+  function hrefTargetsWatchPage(href) {
+    const url = parseUrlLike(href);
+    return Boolean(url && url.pathname === "/watch" && url.searchParams.get("v"));
+  }
+
+  function urlValueTargetsWatchPage(urlValue) {
+    const url = parseUrlLike(urlValue);
+    return Boolean(url && url.pathname === "/watch");
+  }
+
+  function findAnchorFromEvent(event) {
+    return event.target instanceof Element ? event.target.closest("a[href]") : null;
+  }
+
+  function stopEvent(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") {
+      event.stopImmediatePropagation();
+    }
+  }
+
   function isWhitelisted(identity) {
     if (!identity) return false;
     const channelIdAllowed = Boolean(identity.channelId && settings.channelIds.includes(identity.channelId));
@@ -329,6 +360,34 @@
   function shouldTreatAsVideoTile(el) {
     if (!el || !(el instanceof HTMLElement)) return false;
     return TILE_SELECTORS.includes(el.tagName.toLowerCase());
+  }
+
+  function maybeBlockWatchNavFromEvent(event) {
+    if (!settings.enforceWatchGuard) return;
+
+    const anchor = findAnchorFromEvent(event);
+    if (!anchor) return;
+
+    const href = anchor.getAttribute("href") || "";
+    if (!hrefTargetsWatchPage(href)) return;
+
+    const tile = anchor.closest(TILE_SELECTORS.join(","));
+    if (!(tile instanceof HTMLElement)) return;
+
+    const identity = resolveTileIdentity(tile);
+    if (!identity || isWhitelistedForWatchGuard(identity)) return;
+
+    log("Blocking watch navigation before route change", identity);
+    stopEvent(event);
+    setWatchGuardHidden(true);
+    redirectToSubscriptions();
+  }
+
+  function onNavigateStart(event) {
+    if (!settings.enforceWatchGuard) return;
+    if (urlValueTargetsWatchPage(event?.detail?.url)) {
+      setWatchGuardHidden(true);
+    }
   }
 
   function isRecommendationTile(tile) {
@@ -706,8 +765,20 @@
     startObserver();
     onRouteChange();
 
+    window.addEventListener("yt-navigate-start", onNavigateStart, true);
     window.addEventListener("yt-navigate-finish", onRouteChange, true);
     window.addEventListener("yt-page-data-updated", onRouteChange, true);
+
+    // Intercept watch-link navigation as early as possible.
+    document.addEventListener("pointerdown", maybeBlockWatchNavFromEvent, true);
+    document.addEventListener("mousedown", maybeBlockWatchNavFromEvent, true);
+    document.addEventListener("touchstart", maybeBlockWatchNavFromEvent, true);
+    document.addEventListener("click", maybeBlockWatchNavFromEvent, true);
+    document.addEventListener("auxclick", maybeBlockWatchNavFromEvent, true);
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      maybeBlockWatchNavFromEvent(event);
+    }, true);
   }
 
   init().catch((err) => {
