@@ -30,6 +30,7 @@
   let observer = null;
   let watchGuardTimer = null;
   let bootstrapTimer = null;
+  let recommendationsTicker = null;
 
   function log(...args) {
     if (settings.debug) {
@@ -106,7 +107,6 @@
     if (!identity) return false;
     if (isWhitelisted(identity)) return true;
 
-    // Guard against false blocks when YouTube only exposes handle on watch metadata.
     if (settings.whitelistSubscriptionsByDefault && identity.handle) {
       return settings.handles.includes(identity.handle);
     }
@@ -146,6 +146,8 @@
       "a.yt-simple-endpoint.yt-formatted-string[href^='/@']",
       "ytd-channel-name a[href*='/channel/']",
       "ytd-channel-name a[href^='/@']",
+      "#channel-name a[href*='/channel/']",
+      "#channel-name a[href^='/@']",
       "a[href*='/channel/']",
       "a[href^='/@']"
     ];
@@ -159,9 +161,64 @@
     return null;
   }
 
+  function extractIdentityFromTileData(tile) {
+    const data = tile?.data || tile?.__data?.data || tile?.__dataHost?.data;
+    if (!data) return null;
+
+    const runs =
+      data?.shortBylineText?.runs ||
+      data?.longBylineText?.runs ||
+      data?.ownerText?.runs ||
+      data?.bylineText?.runs ||
+      [];
+
+    const browseEndpoint = runs?.[0]?.navigationEndpoint?.browseEndpoint;
+    const browseId = normalizeChannelId(browseEndpoint?.browseId || "");
+
+    let handle = "";
+    const canonicalBaseUrl = browseEndpoint?.canonicalBaseUrl || "";
+    if (canonicalBaseUrl.startsWith("/@")) {
+      handle = normalizeHandle(canonicalBaseUrl.slice(1));
+    }
+
+    if (!handle) {
+      const webUrl = runs?.[0]?.navigationEndpoint?.commandMetadata?.webCommandMetadata?.url || "";
+      if (webUrl.startsWith("/@")) {
+        handle = normalizeHandle(webUrl.slice(1));
+      }
+    }
+
+    if (!browseId && !handle) return null;
+    return { channelId: browseId, handle };
+  }
+
+  function resolveTileIdentity(tile) {
+    const href = getChannelLinkFromTile(tile);
+    const fromHref = extractIdentityFromUrl(href);
+    if (fromHref && (fromHref.channelId || fromHref.handle)) {
+      return fromHref;
+    }
+
+    return extractIdentityFromTileData(tile);
+  }
+
   function removeNode(node) {
     if (!node || !node.isConnected) return;
     node.remove();
+  }
+
+  function setUnresolvedHidden(tile, hidden) {
+    if (!tile || !tile.isConnected) return;
+    if (hidden) {
+      tile.dataset.bsHiddenUnresolved = "1";
+      tile.style.display = "none";
+      return;
+    }
+
+    if (tile.dataset.bsHiddenUnresolved === "1") {
+      delete tile.dataset.bsHiddenUnresolved;
+      tile.style.removeProperty("display");
+    }
   }
 
   function isShortsTile(tile) {
@@ -183,8 +240,7 @@
   }
 
   function tryWhitelistFromTile(tile, next) {
-    const channelHref = getChannelLinkFromTile(tile);
-    const identity = extractIdentityFromUrl(channelHref);
+    const identity = resolveTileIdentity(tile);
     if (!identity) return false;
 
     let changed = false;
@@ -211,16 +267,16 @@
       return;
     }
 
-    const channelHref = getChannelLinkFromTile(tile);
-    if (!channelHref) {
-      // For watch recommendations, fail closed so unknown channels never remain visible.
-      if (options.removeIfUnresolved) {
-        removeNode(tile);
+    const identity = resolveTileIdentity(tile);
+    if (!identity) {
+      if (options.hideIfUnresolved) {
+        setUnresolvedHidden(tile, true);
       }
       return;
     }
 
-    const identity = extractIdentityFromUrl(channelHref);
+    setUnresolvedHidden(tile, false);
+
     if (!isWhitelisted(identity)) {
       removeNode(tile);
     }
@@ -294,9 +350,26 @@
 
     for (const selector of recommendationSelectors) {
       document.querySelectorAll(selector).forEach((tile) => {
-        filterTile(tile, { removeIfUnresolved: true });
+        filterTile(tile, { hideIfUnresolved: true });
       });
     }
+  }
+
+  function startRecommendationsTicker() {
+    if (recommendationsTicker) return;
+    recommendationsTicker = setInterval(() => {
+      if (!isWatchPage()) {
+        stopRecommendationsTicker();
+        return;
+      }
+      forceFilterRecommendations();
+    }, 500);
+  }
+
+  function stopRecommendationsTicker() {
+    if (!recommendationsTicker) return;
+    clearInterval(recommendationsTicker);
+    recommendationsTicker = null;
   }
 
   function extractCurrentWatchIdentity() {
@@ -373,6 +446,12 @@
       return;
     }
 
+    if (isWatchPage()) {
+      startRecommendationsTicker();
+    } else {
+      stopRecommendationsTicker();
+    }
+
     const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
 
     scheduleWatchGuard();
@@ -445,4 +524,3 @@
     getCurrentPageIdentity
   };
 })();
-

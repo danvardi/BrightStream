@@ -16,10 +16,13 @@
     );
   }
 
+  function isRootPath(pathname) {
+    const path = normalizePath(pathname || "");
+    return path === "" || path === "/";
+  }
+
   function shouldRedirectToSubs(url) {
-    const path = normalizePath(url.pathname);
-    const isRoot = path === "" || path === "/";
-    return isRoot || isBlockedShortsPath(path);
+    return isRootPath(url.pathname) || isBlockedShortsPath(url.pathname);
   }
 
   function ensureShortsHidden() {
@@ -103,6 +106,8 @@
     enforce();
   }, true);
 
+  window.addEventListener("yt-navigate-finish", enforce, true);
+  window.addEventListener("yt-page-data-updated", enforce, true);
   window.addEventListener("popstate", enforce, true);
   window.addEventListener("hashchange", enforce, true);
 
@@ -117,4 +122,7 @@
     if (event.key !== "Enter" && event.key !== " ") return;
     blockShortsNavFromEvent(event);
   }, true);
+
+  // Fallback for rare SPA transitions where YouTube mutates URL without expected events.
+  setInterval(enforce, 400);
 })();
