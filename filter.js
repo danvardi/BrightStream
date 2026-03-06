@@ -122,6 +122,13 @@
     return false;
   }
 
+  function isWhitelistedForRecommendations(identity) {
+    if (!identity) return false;
+    const channelIdAllowed = Boolean(identity.channelId && settings.channelIds.includes(identity.channelId));
+    const handleAllowed = Boolean(identity.handle && settings.handles.includes(identity.handle));
+    return channelIdAllowed || handleAllowed;
+  }
+
   function extractIdentityFromUrl(urlValue) {
     if (!urlValue) return null;
     let url;
@@ -286,7 +293,7 @@
     fetchIdentityForVideoId(videoId)
       .then((identity) => {
         if (!identity) return;
-        if (tile.isConnected && !isWhitelisted(identity)) {
+        if (tile.isConnected && !isWhitelistedForRecommendations(identity)) {
           removeNode(tile);
         }
       })
@@ -354,7 +361,7 @@
     if (recommendationMode) {
       const directIdentity = extractIdentityFromUrl(getChannelLinkFromTile(tile));
       if (directIdentity && (directIdentity.channelId || directIdentity.handle)) {
-        if (!isWhitelisted(directIdentity)) {
+        if (!isWhitelistedForRecommendations(directIdentity)) {
           removeNode(tile);
         }
       } else {
@@ -623,6 +630,8 @@
     getCurrentPageIdentity
   };
 })();
+
+
 
 
 
