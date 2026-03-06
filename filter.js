@@ -31,6 +31,8 @@
   let watchGuardTimer = null;
   let bootstrapTimer = null;
   let recommendationsTicker = null;
+  const recommendationIdentityCache = new Map();
+  const recommendationResolveInFlight = new Set();
 
   function log(...args) {
     if (settings.debug) {
@@ -202,23 +204,81 @@
     return extractIdentityFromTileData(tile);
   }
 
+  function getVideoLinkFromTile(tile) {
+    if (!tile) return "";
+
+    const selectors = [
+      "a#thumbnail[href*='/watch']",
+      "a.yt-simple-endpoint[href*='/watch']",
+      "a[href*='/watch?v=']"
+    ];
+
+    for (const selector of selectors) {
+      const link = tile.querySelector(selector);
+      const href = link?.getAttribute("href") || "";
+      if (href) return href;
+    }
+
+    return "";
+  }
+
+  function extractVideoIdFromHref(href) {
+    if (!href) return "";
+    try {
+      const url = new URL(href, window.location.origin);
+      return url.searchParams.get("v") || "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function fetchIdentityForVideoId(videoId) {
+    if (!videoId) return null;
+    if (recommendationIdentityCache.has(videoId)) {
+      return recommendationIdentityCache.get(videoId);
+    }
+
+    const response = await fetch(`/watch?v=${encodeURIComponent(videoId)}`, {
+      credentials: "same-origin"
+    });
+    if (!response.ok) return null;
+
+    const text = await response.text();
+    const channelIdMatch = text.match(/"channelId":"(UC[^"]+)"/);
+    const canonicalBaseUrlMatch = text.match(/"canonicalBaseUrl":"\\\/@([^"\\]+)"/);
+
+    const channelId = normalizeChannelId(channelIdMatch?.[1] || "");
+    const handle = normalizeHandle(canonicalBaseUrlMatch?.[1] ? `@${canonicalBaseUrlMatch[1]}` : "");
+
+    if (!channelId && !handle) return null;
+
+    const identity = { channelId, handle };
+    recommendationIdentityCache.set(videoId, identity);
+    return identity;
+  }
+
   function removeNode(node) {
     if (!node || !node.isConnected) return;
     node.remove();
   }
 
-  function setUnresolvedHidden(tile, hidden) {
-    if (!tile || !tile.isConnected) return;
-    if (hidden) {
-      tile.dataset.bsHiddenUnresolved = "1";
-      tile.style.display = "none";
-      return;
-    }
+  function resolveRecommendationTileIdentity(tile) {
+    const href = getVideoLinkFromTile(tile);
+    const videoId = extractVideoIdFromHref(href);
+    if (!videoId || recommendationResolveInFlight.has(videoId)) return;
 
-    if (tile.dataset.bsHiddenUnresolved === "1") {
-      delete tile.dataset.bsHiddenUnresolved;
-      tile.style.removeProperty("display");
-    }
+    recommendationResolveInFlight.add(videoId);
+    fetchIdentityForVideoId(videoId)
+      .then((identity) => {
+        if (!identity) return;
+        if (tile.isConnected && !isWhitelisted(identity)) {
+          removeNode(tile);
+        }
+      })
+      .catch((err) => log("Recommendation resolve failed", err))
+      .finally(() => {
+        recommendationResolveInFlight.delete(videoId);
+      });
   }
 
   function isShortsTile(tile) {
@@ -269,13 +329,11 @@
 
     const identity = resolveTileIdentity(tile);
     if (!identity) {
-      if (options.hideIfUnresolved) {
-        setUnresolvedHidden(tile, true);
+      if (options.resolveFromVideo) {
+        resolveRecommendationTileIdentity(tile);
       }
       return;
     }
-
-    setUnresolvedHidden(tile, false);
 
     if (!isWhitelisted(identity)) {
       removeNode(tile);
@@ -350,7 +408,7 @@
 
     for (const selector of recommendationSelectors) {
       document.querySelectorAll(selector).forEach((tile) => {
-        filterTile(tile, { hideIfUnresolved: true });
+        filterTile(tile, { resolveFromVideo: true });
       });
     }
   }
