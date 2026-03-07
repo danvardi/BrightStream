@@ -11,6 +11,8 @@
     "ytd-playlist-video-renderer",
     "ytd-compact-radio-renderer",
     "ytd-compact-playlist-renderer",
+    "ytd-lockup-view-model",
+    "yt-lockup-view-model",
     "ytd-reel-shelf-renderer",
     "ytd-reel-item-renderer"
   ];
@@ -29,6 +31,9 @@
     debug: false
   };
 
+  const SEARCH_RESOLVE_RETRY_DELAY_MS = 150;
+  const SEARCH_RESOLVE_MAX_RETRIES = 20;
+
   let settings = { ...DEFAULTS };
   let rateUsage = { dayKey: "", secondsByKey: {} };
   let observer = null;
@@ -46,6 +51,8 @@
   let exemptPlayback = { videoId: "", channelKey: "" };
   const recommendationIdentityCache = new Map();
   const recommendationResolveInFlight = new Set();
+  const searchPendingTilesByVideoId = new Map();
+  const searchRetryTimers = new WeakMap();
 
   function log(...args) {
     if (settings.debug) {
@@ -223,6 +230,10 @@
     return getPathname().startsWith("/feed/subscriptions");
   }
 
+  function isSearchPage() {
+    return getPathname().startsWith("/results");
+  }
+
   function isHomePage() {
     const path = getPathname();
     return path === "" || path === "/";
@@ -378,6 +389,13 @@
     return channelIdAllowed || handleAllowed;
   }
 
+  function isWhitelistedForSearch(identity) {
+    if (!identity) return false;
+    const channelIdAllowed = Boolean(identity.channelId && settings.channelIds.includes(identity.channelId));
+    const handleAllowed = Boolean(identity.handle && settings.handles.includes(identity.handle));
+    return channelIdAllowed || handleAllowed;
+  }
+
   function isAllowedForRecommendations(identity) {
     if (!isWhitelistedForRecommendations(identity)) return false;
     return !isRateLimited(identity);
@@ -442,7 +460,7 @@
       [];
 
     const browseEndpoint = runs?.[0]?.navigationEndpoint?.browseEndpoint;
-    const browseId = normalizeChannelId(browseEndpoint?.browseId || "");
+    let browseId = normalizeChannelId(browseEndpoint?.browseId || "");
 
     let handle = "";
     const canonicalBaseUrl = browseEndpoint?.canonicalBaseUrl || "";
@@ -454,6 +472,56 @@
       const webUrl = runs?.[0]?.navigationEndpoint?.commandMetadata?.webCommandMetadata?.url || "";
       if (webUrl.startsWith("/@")) {
         handle = normalizeHandle(webUrl.slice(1));
+      }
+    }
+
+    if (!browseId || !handle) {
+      // Search lockup renderers often store channel identity outside byline runs.
+      const seen = new Set();
+      const queue = [{ value: data, depth: 0 }];
+      let processed = 0;
+
+      while (queue.length && processed < 300 && (!browseId || !handle)) {
+        const current = queue.shift();
+        const value = current?.value;
+        const depth = current?.depth || 0;
+        processed += 1;
+
+        if (!value || typeof value !== "object") continue;
+        if (seen.has(value)) continue;
+        seen.add(value);
+
+        if (!browseId && typeof value.browseId === "string" && value.browseId.startsWith("UC")) {
+          browseId = normalizeChannelId(value.browseId);
+        }
+
+        if (!handle) {
+          const candidates = [value.canonicalBaseUrl, value.url];
+          for (const candidate of candidates) {
+            if (typeof candidate !== "string") continue;
+            if (candidate.startsWith("/@")) {
+              handle = normalizeHandle(candidate.slice(1));
+              break;
+            }
+          }
+        }
+
+        if (depth >= 6) continue;
+
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            if (item && typeof item === "object") {
+              queue.push({ value: item, depth: depth + 1 });
+            }
+          }
+          continue;
+        }
+
+        for (const child of Object.values(value)) {
+          if (child && typeof child === "object") {
+            queue.push({ value: child, depth: depth + 1 });
+          }
+        }
       }
     }
 
@@ -536,22 +604,238 @@
       });
   }
 
+  function hideTilePendingResolution(tile) {
+    if (!(tile instanceof HTMLElement)) return;
+    tile.dataset.bsSearchPending = "1";
+    tile.style.display = "none";
+  }
+
+  function clearSearchRetryTimer(tile) {
+    const timer = searchRetryTimers.get(tile);
+    if (timer) {
+      clearTimeout(timer);
+      searchRetryTimers.delete(tile);
+    }
+  }
+
+  function scheduleSearchRetry(tile) {
+    if (!(tile instanceof HTMLElement)) return;
+    if (searchRetryTimers.has(tile)) return;
+
+    const timer = setTimeout(() => {
+      searchRetryTimers.delete(tile);
+      if (!tile.isConnected) return;
+      resolveSearchTileIdentity(tile);
+    }, SEARCH_RESOLVE_RETRY_DELAY_MS);
+
+    searchRetryTimers.set(tile, timer);
+  }
+
+  function showTileAfterResolution(tile) {
+    if (!(tile instanceof HTMLElement)) return;
+    clearSearchRetryTimer(tile);
+    delete tile.dataset.bsSearchRetryCount;
+    if (!tile.dataset.bsSearchPending) return;
+    delete tile.dataset.bsSearchPending;
+    tile.style.removeProperty("display");
+  }
+
+  function resolveSearchPendingState(videoId) {
+    let state = searchPendingTilesByVideoId.get(videoId);
+    if (state) return state;
+
+    state = { tiles: new Set(), inFlight: false };
+    searchPendingTilesByVideoId.set(videoId, state);
+    return state;
+  }
+
+  function settleSearchTiles(videoId, shouldShow) {
+    const state = searchPendingTilesByVideoId.get(videoId);
+    if (!state) return;
+
+    searchPendingTilesByVideoId.delete(videoId);
+    state.tiles.forEach((tile) => {
+      if (!(tile instanceof HTMLElement) || !tile.isConnected) return;
+      if (shouldShow) {
+        showTileAfterResolution(tile);
+      } else {
+        clearSearchRetryTimer(tile);
+        removeNode(tile);
+      }
+    });
+  }
+
+  function resolveSearchTileIdentity(tile) {
+    if (!(tile instanceof HTMLElement)) return;
+    if (!settings.blockShorts || !isSearchPage()) return;
+
+    const href = getVideoLinkFromTile(tile);
+    const videoId = extractVideoIdFromHref(href);
+    if (!videoId) {
+      hideTilePendingResolution(tile);
+      const retries = Number(tile.dataset.bsSearchRetryCount || 0);
+      if (retries >= SEARCH_RESOLVE_MAX_RETRIES) {
+        clearSearchRetryTimer(tile);
+        removeNode(tile);
+        return;
+      }
+      tile.dataset.bsSearchRetryCount = String(retries + 1);
+      scheduleSearchRetry(tile);
+      return;
+    }
+
+    clearSearchRetryTimer(tile);
+    delete tile.dataset.bsSearchRetryCount;
+    hideTilePendingResolution(tile);
+
+    const state = resolveSearchPendingState(videoId);
+    state.tiles.add(tile);
+    if (state.inFlight) return;
+
+    state.inFlight = true;
+    fetchIdentityForVideoId(videoId)
+      .then((identity) => {
+        const shouldShow = Boolean(identity && !isRateLimited(identity) && isWhitelistedForSearch(identity));
+        settleSearchTiles(videoId, shouldShow);
+      })
+      .catch(() => {
+        settleSearchTiles(videoId, false);
+      });
+  }
+
   function removeNode(node) {
     if (!node || !node.isConnected) return;
     node.remove();
   }
 
+  function normalizePathname(pathname) {
+    return pathname.endsWith("/") && pathname.length > 1 ? pathname.slice(0, -1) : pathname;
+  }
+
+  function isShortsPath(pathname) {
+    const path = normalizePathname(pathname || "");
+    return path === "/shorts" || path.startsWith("/shorts/");
+  }
+
+  function hrefTargetsShorts(href) {
+    if (!href) return false;
+    try {
+      const url = new URL(href, window.location.origin);
+      return isShortsPath(url.pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  function tileDataHasShortsUrl(tile) {
+    const roots = [tile?.data, tile?.__data?.data, tile?.__dataHost?.data].filter(Boolean);
+    if (!roots.length) return false;
+
+    for (const root of roots) {
+      const seen = new Set();
+      const queue = [{ value: root, depth: 0 }];
+      let processed = 0;
+
+      while (queue.length && processed < 250) {
+        const { value, depth } = queue.shift();
+        processed += 1;
+        if (!value) continue;
+
+        if (typeof value === "string") {
+          if (hrefTargetsShorts(value)) {
+            return true;
+          }
+          continue;
+        }
+
+        if (typeof value !== "object") continue;
+        if (seen.has(value)) continue;
+        seen.add(value);
+
+        if (depth >= 6) continue;
+
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            queue.push({ value: item, depth: depth + 1 });
+          }
+          continue;
+        }
+
+        for (const [key, child] of Object.entries(value)) {
+          if (typeof child === "string") {
+            const normalizedKey = key.toLowerCase();
+            if ((normalizedKey === "url" || normalizedKey.endsWith("url")) && hrefTargetsShorts(child)) {
+              return true;
+            }
+            if (normalizedKey.includes("shorts") && hrefTargetsShorts(child)) {
+              return true;
+            }
+          } else if (child && typeof child === "object") {
+            queue.push({ value: child, depth: depth + 1 });
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
   function isShortsTile(tile) {
     if (!settings.blockShorts) return false;
+
+    const tag = tile.tagName.toLowerCase();
+    if (tag.includes("reel") || tag.includes("shorts")) return true;
 
     const links = tile.querySelectorAll("a[href]");
     for (const link of links) {
       const href = link.getAttribute("href") || "";
-      if (href.includes("/shorts/") || href === "/shorts") return true;
+      if (hrefTargetsShorts(href)) return true;
     }
+
+    if (tileDataHasShortsUrl(tile)) return true;
 
     const text = (tile.textContent || "").toLowerCase();
     return text.includes("shorts");
+  }
+
+  function removeShortsSections(root = document) {
+    if (!settings.blockShorts || !root?.querySelectorAll) return;
+
+    const hardShortsSelectors = [
+      "ytd-reel-shelf-renderer",
+      "ytd-reel-item-renderer",
+      "ytd-shorts-lockup-view-model",
+      "yt-shorts-lockup-view-model",
+      "ytm-shorts-lockup-view-model"
+    ];
+
+    root.querySelectorAll(hardShortsSelectors.join(",")).forEach((node) => removeNode(node));
+
+    root.querySelectorAll("a[href]").forEach((anchor) => {
+      const href = anchor.getAttribute("href") || "";
+      if (!hrefTargetsShorts(href)) return;
+
+      const shortsHost = anchor.closest(
+        [
+          "ytd-reel-item-renderer",
+          "ytd-reel-shelf-renderer",
+          "ytd-shorts-lockup-view-model",
+          "yt-shorts-lockup-view-model",
+          "ytm-shorts-lockup-view-model",
+          "ytd-rich-item-renderer",
+          "ytd-video-renderer",
+          "ytd-lockup-view-model",
+          "yt-lockup-view-model",
+          "ytd-shelf-renderer",
+          "ytd-rich-shelf-renderer",
+          "ytd-item-section-renderer"
+        ].join(",")
+      );
+
+      if (shortsHost) {
+        removeNode(shortsHost);
+      }
+    });
   }
 
   function shouldTreatAsVideoTile(el) {
@@ -636,6 +920,9 @@
 
     const identity = resolveTileIdentity(tile);
     if (!identity) {
+      if (options.failClosed) {
+        resolveSearchTileIdentity(tile);
+      }
       return;
     }
 
@@ -665,7 +952,9 @@
 
   function applyFiltersForCurrentPage() {
     const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
-    filterExistingTiles(document, { skipWhitelist, excludeRecommendations: isWatchPage() });
+    const failClosed = isSearchPage();
+    filterExistingTiles(document, { skipWhitelist, excludeRecommendations: isWatchPage(), failClosed });
+    removeShortsSections(document);
     forceFilterRecommendations();
   }
 
@@ -1010,6 +1299,7 @@
 
     observer = new MutationObserver((mutations) => {
       const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
+      const failClosed = isSearchPage();
       syncPlaybackVideoElement();
 
       for (const mutation of mutations) {
@@ -1017,15 +1307,16 @@
           if (!(node instanceof HTMLElement)) return;
 
           if (shouldTreatAsVideoTile(node)) {
-            filterTile(node, { skipWhitelist, excludeRecommendations: isWatchPage() });
+            filterTile(node, { skipWhitelist, excludeRecommendations: isWatchPage(), failClosed });
           }
 
           const closestTile = node.closest ? node.closest(TILE_SELECTORS.join(",")) : null;
           if (closestTile instanceof HTMLElement) {
-            filterTile(closestTile, { skipWhitelist, excludeRecommendations: isWatchPage() });
+            filterTile(closestTile, { skipWhitelist, excludeRecommendations: isWatchPage(), failClosed });
           }
 
-          filterExistingTiles(node, { skipWhitelist, excludeRecommendations: isWatchPage() });
+          filterExistingTiles(node, { skipWhitelist, excludeRecommendations: isWatchPage(), failClosed });
+          removeShortsSections(node);
         });
       }
 
@@ -1068,9 +1359,11 @@
     }
 
     const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
+    const failClosed = isSearchPage();
 
     scheduleWatchGuard();
-    filterExistingTiles(document, { skipWhitelist, excludeRecommendations: isWatchPage() });
+    filterExistingTiles(document, { skipWhitelist, excludeRecommendations: isWatchPage(), failClosed });
+    removeShortsSections(document);
     scheduleSubscriptionsBootstrap();
     forceFilterRecommendations();
   }
@@ -1383,7 +1676,4 @@
     getCurrentPageIdentity
   };
 })();
-
-
-
 
