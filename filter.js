@@ -1,5 +1,6 @@
-﻿(() => {
+(() => {
   const SETTINGS_KEY = "ytWhitelistSettings";
+  const RATE_USAGE_KEY = "ytRateUsageDailyV1";
   const SUBS_URL = "https://www.youtube.com/feed/subscriptions";
   const WATCH_GUARD_HIDE_STYLE_ID = "brightstream-watch-guard-style";
   const TILE_SELECTORS = [
@@ -15,10 +16,11 @@
   ];
 
   const DEFAULTS = {
-    version: 2,
+    version: 3,
     mode: "strict",
     channelIds: [],
     handles: [],
+    channelRateLimitsMinutesByKey: {},
     blockShorts: true,
     enforceWatchGuard: true,
     whitelistSubscriptionsByDefault: true,
@@ -28,11 +30,20 @@
   };
 
   let settings = { ...DEFAULTS };
+  let rateUsage = { dayKey: "", secondsByKey: {} };
   let observer = null;
   let watchGuardTimer = null;
   let watchGuardProbeToken = 0;
   let bootstrapTimer = null;
   let recommendationsTicker = null;
+  let playbackTicker = null;
+  let playbackLastTickAt = 0;
+  let playbackCarrySeconds = 0;
+  let playbackPendingPersistSeconds = 0;
+  let playbackUsageDirty = false;
+  let rateUsageFlushInFlight = null;
+  let playbackVideoEl = null;
+  let exemptPlayback = { videoId: "", channelKey: "" };
   const recommendationIdentityCache = new Map();
   const recommendationResolveInFlight = new Set();
 
@@ -54,10 +65,84 @@
     return value.trim();
   }
 
+  function normalizeRateLimitKey(key) {
+    if (!key) return "";
+    const text = String(key).trim();
+    if (!text) return "";
+
+    if (text.startsWith("id:")) {
+      const channelId = normalizeChannelId(text.slice(3));
+      return channelId ? `id:${channelId}` : "";
+    }
+
+    if (text.startsWith("handle:")) {
+      const handle = normalizeHandle(text.slice(7));
+      return handle ? `handle:${handle}` : "";
+    }
+
+    return "";
+  }
+
+  function normalizeRateLimitMinutes(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return null;
+
+    const minutes = Math.floor(num);
+    if (minutes < 1 || minutes > 1440) return null;
+    return minutes;
+  }
+
+  function normalizeRateLimitMap(raw) {
+    if (!raw || typeof raw !== "object") return {};
+
+    const normalized = {};
+    for (const [rawKey, rawValue] of Object.entries(raw)) {
+      const key = normalizeRateLimitKey(rawKey);
+      const minutes = normalizeRateLimitMinutes(rawValue);
+      if (!key || minutes === null) continue;
+      normalized[key] = minutes;
+    }
+    return normalized;
+  }
+
+  function getLocalDayKey(date = new Date()) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function normalizeRateUsage(raw) {
+    const today = getLocalDayKey();
+    const next = {
+      dayKey: typeof raw?.dayKey === "string" ? raw.dayKey : today,
+      secondsByKey: {}
+    };
+
+    if (raw?.secondsByKey && typeof raw.secondsByKey === "object") {
+      for (const [rawKey, rawValue] of Object.entries(raw.secondsByKey)) {
+        const key = normalizeRateLimitKey(rawKey);
+        if (!key) continue;
+
+        const secondsNum = Number(rawValue);
+        if (!Number.isFinite(secondsNum) || secondsNum <= 0) continue;
+        next.secondsByKey[key] = Math.floor(secondsNum);
+      }
+    }
+
+    if (next.dayKey !== today) {
+      return { dayKey: today, secondsByKey: {} };
+    }
+
+    return next;
+  }
+
   function normalizeSettings(raw) {
     const merged = { ...DEFAULTS, ...(raw || {}) };
+    merged.version = 3;
     merged.channelIds = [...new Set((merged.channelIds || []).map(normalizeChannelId).filter(Boolean))];
     merged.handles = [...new Set((merged.handles || []).map(normalizeHandle).filter(Boolean))];
+    merged.channelRateLimitsMinutesByKey = normalizeRateLimitMap(merged.channelRateLimitsMinutesByKey);
     merged.mode = merged.mode === "lenient" ? "lenient" : "strict";
     merged.whitelistSubscriptionsByDefault = merged.whitelistSubscriptionsByDefault !== false;
     return merged;
@@ -72,6 +157,58 @@
   async function saveSettings(next) {
     settings = normalizeSettings(next);
     await chrome.storage.sync.set({ [SETTINGS_KEY]: settings });
+  }
+
+  async function loadRateUsage() {
+    const data = await chrome.storage.local.get([RATE_USAGE_KEY]);
+    rateUsage = normalizeRateUsage(data[RATE_USAGE_KEY]);
+    return rateUsage;
+  }
+
+  function markRateUsageDirty(secondsDelta = 0) {
+    playbackUsageDirty = true;
+    if (secondsDelta > 0) {
+      playbackPendingPersistSeconds += secondsDelta;
+    }
+  }
+
+  function ensureRateUsageCurrentDay() {
+    const today = getLocalDayKey();
+    if (rateUsage.dayKey === today) return;
+
+    rateUsage = { dayKey: today, secondsByKey: {} };
+    exemptPlayback = { videoId: "", channelKey: "" };
+    markRateUsageDirty(15);
+  }
+
+  async function persistRateUsage(force = false) {
+    if (!playbackUsageDirty) return;
+    if (!force && playbackPendingPersistSeconds < 15) return;
+
+    if (rateUsageFlushInFlight) {
+      await rateUsageFlushInFlight;
+      if (!playbackUsageDirty) return;
+      if (!force && playbackPendingPersistSeconds < 15) return;
+    }
+
+    const payload = {
+      dayKey: rateUsage.dayKey,
+      secondsByKey: { ...(rateUsage.secondsByKey || {}) }
+    };
+
+    playbackUsageDirty = false;
+    playbackPendingPersistSeconds = 0;
+
+    rateUsageFlushInFlight = chrome.storage.local.set({ [RATE_USAGE_KEY]: payload })
+      .catch((err) => {
+        playbackUsageDirty = true;
+        log("Rate usage persist failed", err);
+      })
+      .finally(() => {
+        rateUsageFlushInFlight = null;
+      });
+
+    await rateUsageFlushInFlight;
   }
 
   function getPathname() {
@@ -155,6 +292,53 @@
     }
   }
 
+  function resolveRateLimitConfig(identity) {
+    if (!identity) return null;
+
+    const idKey = identity.channelId ? `id:${normalizeChannelId(identity.channelId)}` : "";
+    if (idKey && settings.channelRateLimitsMinutesByKey[idKey]) {
+      return { key: idKey, minutes: settings.channelRateLimitsMinutesByKey[idKey] };
+    }
+
+    const handleKey = identity.handle ? `handle:${normalizeHandle(identity.handle)}` : "";
+    if (handleKey && settings.channelRateLimitsMinutesByKey[handleKey]) {
+      return { key: handleKey, minutes: settings.channelRateLimitsMinutesByKey[handleKey] };
+    }
+
+    return null;
+  }
+
+  function getUsedSecondsForKey(key) {
+    ensureRateUsageCurrentDay();
+    return Number(rateUsage.secondsByKey?.[key] || 0);
+  }
+
+  function isCurrentVideoExemptForKey(key) {
+    if (!key) return false;
+    if (!exemptPlayback.videoId || !exemptPlayback.channelKey) return false;
+    if (exemptPlayback.channelKey !== key) return false;
+
+    const currentVideoId = getCurrentVideoIdFromLocation();
+    if (!currentVideoId) return false;
+    return currentVideoId === exemptPlayback.videoId;
+  }
+
+  function isRateLimited(identity, options = {}) {
+    const { allowCurrentVideoExempt = false } = options;
+    const config = resolveRateLimitConfig(identity);
+    if (!config) return false;
+
+    const usedSeconds = getUsedSecondsForKey(config.key);
+    const limitSeconds = config.minutes * 60;
+    if (usedSeconds < limitSeconds) return false;
+
+    if (allowCurrentVideoExempt && isCurrentVideoExemptForKey(config.key)) {
+      return false;
+    }
+
+    return true;
+  }
+
   function isWhitelisted(identity) {
     if (!identity) return false;
     const channelIdAllowed = Boolean(identity.channelId && settings.channelIds.includes(identity.channelId));
@@ -170,13 +354,16 @@
 
   function isWhitelistedForWatchGuard(identity) {
     if (!identity) return false;
-    if (isWhitelisted(identity)) return true;
 
-    if (settings.whitelistSubscriptionsByDefault && identity.handle) {
-      return settings.handles.includes(identity.handle);
+    let allowed = false;
+    if (isWhitelisted(identity)) {
+      allowed = true;
+    } else if (settings.whitelistSubscriptionsByDefault && identity.handle) {
+      allowed = settings.handles.includes(identity.handle);
     }
 
-    return false;
+    if (!allowed) return false;
+    return !isRateLimited(identity, { allowCurrentVideoExempt: true });
   }
 
   function isWhitelistedForRecommendations(identity) {
@@ -184,6 +371,11 @@
     const channelIdAllowed = Boolean(identity.channelId && settings.channelIds.includes(identity.channelId));
     const handleAllowed = Boolean(identity.handle && settings.handles.includes(identity.handle));
     return channelIdAllowed || handleAllowed;
+  }
+
+  function isAllowedForRecommendations(identity) {
+    if (!isWhitelistedForRecommendations(identity)) return false;
+    return !isRateLimited(identity);
   }
 
   function extractIdentityFromUrl(urlValue) {
@@ -329,7 +521,7 @@
     fetchIdentityForVideoId(videoId)
       .then((identity) => {
         if (!identity) return;
-        if (tile.isConnected && !isWhitelistedForRecommendations(identity)) {
+        if (tile.isConnected && !isAllowedForRecommendations(identity)) {
           removeNode(tile);
         }
       })
@@ -384,6 +576,8 @@
   }
 
   function onNavigateStart(event) {
+    persistRateUsage(true).catch((err) => log("Persist on navigate-start failed", err));
+
     if (!settings.enforceWatchGuard) return;
     if (urlValueTargetsWatchPage(event?.detail?.url)) {
       setWatchGuardHidden(true);
@@ -422,10 +616,6 @@
       return;
     }
 
-    if (options.skipWhitelist) {
-      return;
-    }
-
     const recommendationMode = Boolean(options.recommendation || isRecommendationTile(tile));
     if (recommendationMode) {
       const identity = resolveTileIdentity(tile);
@@ -433,7 +623,7 @@
         resolveRecommendationTileIdentity(tile);
         return;
       }
-      if (!isWhitelistedForRecommendations(identity)) {
+      if (!isAllowedForRecommendations(identity)) {
         removeNode(tile);
       }
       return;
@@ -441,6 +631,15 @@
 
     const identity = resolveTileIdentity(tile);
     if (!identity) {
+      return;
+    }
+
+    if (isRateLimited(identity)) {
+      removeNode(tile);
+      return;
+    }
+
+    if (options.skipWhitelist) {
       return;
     }
 
@@ -457,6 +656,12 @@
       }
       filterTile(tile, options);
     });
+  }
+
+  function applyFiltersForCurrentPage() {
+    const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
+    filterExistingTiles(document, { skipWhitelist, excludeRecommendations: isWatchPage() });
+    forceFilterRecommendations();
   }
 
   async function bootstrapSubscriptionsWhitelist() {
@@ -557,6 +762,32 @@
     }
   }
 
+  function getWatchVideoElement() {
+    const video = document.querySelector("video");
+    return video instanceof HTMLVideoElement ? video : null;
+  }
+
+  function onPlaybackBoundaryEvent() {
+    persistRateUsage(true).catch((err) => log("Persist on playback boundary failed", err));
+  }
+
+  function syncPlaybackVideoElement() {
+    const next = getWatchVideoElement();
+    if (next === playbackVideoEl) return;
+
+    if (playbackVideoEl) {
+      playbackVideoEl.removeEventListener("pause", onPlaybackBoundaryEvent, true);
+      playbackVideoEl.removeEventListener("ended", onPlaybackBoundaryEvent, true);
+    }
+
+    playbackVideoEl = next;
+
+    if (playbackVideoEl) {
+      playbackVideoEl.addEventListener("pause", onPlaybackBoundaryEvent, true);
+      playbackVideoEl.addEventListener("ended", onPlaybackBoundaryEvent, true);
+    }
+  }
+
   function startRecommendationsTicker() {
     if (recommendationsTicker) return;
     recommendationsTicker = setInterval(() => {
@@ -572,6 +803,63 @@
     if (!recommendationsTicker) return;
     clearInterval(recommendationsTicker);
     recommendationsTicker = null;
+  }
+
+  function startPlaybackTicker() {
+    if (playbackTicker) return;
+
+    playbackLastTickAt = Date.now();
+    playbackTicker = setInterval(() => {
+      tickPlaybackTracking().catch((err) => log("Playback tick failed", err));
+    }, 5000);
+  }
+
+  function stopPlaybackTicker() {
+    if (!playbackTicker) return;
+    clearInterval(playbackTicker);
+    playbackTicker = null;
+    playbackLastTickAt = 0;
+    playbackCarrySeconds = 0;
+  }
+
+  function isPlaybackCountable(video) {
+    if (!video) return false;
+    if (!isWatchPage()) return false;
+    if (document.hidden) return false;
+    if (video.paused) return false;
+    if (video.ended) return false;
+    return true;
+  }
+
+  function setExemptPlaybackForCurrentVideo(channelKey) {
+    const videoId = getCurrentVideoIdFromLocation();
+    if (!videoId || !channelKey) return;
+    exemptPlayback = { videoId, channelKey };
+  }
+
+  function clearExemptPlaybackIfVideoChanged() {
+    if (!exemptPlayback.videoId) return;
+    const currentVideoId = getCurrentVideoIdFromLocation();
+    if (!currentVideoId || currentVideoId !== exemptPlayback.videoId) {
+      exemptPlayback = { videoId: "", channelKey: "" };
+    }
+  }
+
+  function addUsageSecondsForConfig(rateConfig, secondsToAdd) {
+    if (!rateConfig || !rateConfig.key || !secondsToAdd) return;
+    ensureRateUsageCurrentDay();
+
+    const limitSeconds = rateConfig.minutes * 60;
+    const before = getUsedSecondsForKey(rateConfig.key);
+    const after = before + secondsToAdd;
+
+    rateUsage.secondsByKey[rateConfig.key] = after;
+    markRateUsageDirty(secondsToAdd);
+
+    if (before < limitSeconds && after >= limitSeconds) {
+      setExemptPlaybackForCurrentVideo(rateConfig.key);
+      applyFiltersForCurrentPage();
+    }
   }
 
   function extractCurrentWatchIdentity() {
@@ -599,8 +887,49 @@
     }
   }
 
+  async function tickPlaybackTracking() {
+    ensureRateUsageCurrentDay();
+
+    if (!isWatchPage()) return;
+
+    syncPlaybackVideoElement();
+
+    const now = Date.now();
+    if (!playbackLastTickAt) {
+      playbackLastTickAt = now;
+      return;
+    }
+
+    const elapsedSeconds = (now - playbackLastTickAt) / 1000;
+    playbackLastTickAt = now;
+
+    if (!Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) return;
+
+    const clampedSeconds = Math.min(elapsedSeconds, 6);
+    const video = playbackVideoEl || getWatchVideoElement();
+    if (!isPlaybackCountable(video)) return;
+
+    const identity = await resolveCurrentWatchIdentity();
+    if (!identity) return;
+
+    const rateConfig = resolveRateLimitConfig(identity);
+    if (!rateConfig) return;
+
+    playbackCarrySeconds += clampedSeconds;
+    const wholeSeconds = Math.floor(playbackCarrySeconds);
+    if (wholeSeconds <= 0) return;
+
+    playbackCarrySeconds -= wholeSeconds;
+    addUsageSecondsForConfig(rateConfig, wholeSeconds);
+
+    if (playbackPendingPersistSeconds >= 15) {
+      await persistRateUsage(false);
+    }
+  }
+
   async function enforceWatchGuardFast() {
     const probeToken = ++watchGuardProbeToken;
+    ensureRateUsageCurrentDay();
 
     if (!isWatchPage() || !settings.enforceWatchGuard) {
       setWatchGuardHidden(false);
@@ -615,7 +944,7 @@
     }
 
     if (identity && !isWhitelistedForWatchGuard(identity)) {
-      log("Blocking watch page (fast guard) for non-whitelisted channel", identity);
+      log("Blocking watch page (fast guard) for blocked channel", identity);
       redirectToSubscriptions();
       return;
     }
@@ -624,6 +953,8 @@
   }
 
   function enforceWatchGuard() {
+    ensureRateUsageCurrentDay();
+
     if (!settings.enforceWatchGuard || !isWatchPage()) {
       setWatchGuardHidden(false);
       return;
@@ -633,7 +964,7 @@
     if (!identity) return;
 
     if (!isWhitelistedForWatchGuard(identity)) {
-      log("Blocking watch page for non-whitelisted channel", identity);
+      log("Blocking watch page for blocked channel", identity);
       redirectToSubscriptions();
       return;
     }
@@ -660,6 +991,7 @@
 
     observer = new MutationObserver((mutations) => {
       const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
+      syncPlaybackVideoElement();
 
       for (const mutation of mutations) {
         mutation.addedNodes.forEach((node) => {
@@ -692,6 +1024,10 @@
   }
 
   function onRouteChange() {
+    ensureRateUsageCurrentDay();
+    persistRateUsage(true).catch((err) => log("Persist on route change failed", err));
+    clearExemptPlaybackIfVideoChanged();
+
     if (shouldBlockByPath()) {
       redirectToSubscriptions();
       return;
@@ -699,8 +1035,12 @@
 
     if (isWatchPage()) {
       startRecommendationsTicker();
+      startPlaybackTicker();
+      syncPlaybackVideoElement();
     } else {
       stopRecommendationsTicker();
+      stopPlaybackTicker();
+      syncPlaybackVideoElement();
     }
 
     const skipWhitelist = settings.whitelistSubscriptionsByDefault && isSubscriptionsPage();
@@ -743,11 +1083,16 @@
   });
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== "sync") return;
-    if (!changes[SETTINGS_KEY]) return;
+    if (areaName === "sync" && changes[SETTINGS_KEY]) {
+      settings = normalizeSettings(changes[SETTINGS_KEY].newValue);
+      onRouteChange();
+      return;
+    }
 
-    settings = normalizeSettings(changes[SETTINGS_KEY].newValue);
-    onRouteChange();
+    if (areaName === "local" && changes[RATE_USAGE_KEY]) {
+      rateUsage = normalizeRateUsage(changes[RATE_USAGE_KEY].newValue);
+      applyFiltersForCurrentPage();
+    }
   });
 
   async function init() {
@@ -755,7 +1100,7 @@
       setWatchGuardHidden(true);
     }
 
-    await loadSettings();
+    await Promise.all([loadSettings(), loadRateUsage()]);
 
     if (shouldBlockByPath()) {
       redirectToSubscriptions();
@@ -779,6 +1124,16 @@
       if (event.key !== "Enter" && event.key !== " ") return;
       maybeBlockWatchNavFromEvent(event);
     }, true);
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        persistRateUsage(true).catch((err) => log("Persist on visibilitychange failed", err));
+      }
+    }, true);
+
+    window.addEventListener("pagehide", () => {
+      persistRateUsage(true).catch((err) => log("Persist on pagehide failed", err));
+    }, true);
   }
 
   init().catch((err) => {
@@ -791,4 +1146,3 @@
     getCurrentPageIdentity
   };
 })();
-

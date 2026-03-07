@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   color-scheme: light;
   font-family: "Segoe UI", Tahoma, sans-serif;
 }
@@ -62,8 +62,43 @@ select {
   background: #fff;
 }
 
+.options input[type="number"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 1px solid #bbb;
+  border-radius: 6px;
+  background: #fff;
+}
+
 .inline-actions {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.muted {
+  margin: 4px 0 8px;
+  color: #555;
+  font-size: 13px;
+}
+
+#rateLimitsTable {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+#rateLimitsTable th,
+#rateLimitsTable td {
+  border-bottom: 1px solid #eee;
+  padding: 8px;
+  text-align: left;
+}
+
+#rateLimitsTable tr:last-child td {
+  border-bottom: none;
 }

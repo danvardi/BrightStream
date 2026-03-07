@@ -1,10 +1,11 @@
-﻿(() => {
+(() => {
   const SETTINGS_KEY = "ytWhitelistSettings";
   const DEFAULTS = {
-    version: 2,
+    version: 3,
     mode: "strict",
     channelIds: [],
     handles: [],
+    channelRateLimitsMinutesByKey: {},
     blockShorts: true,
     enforceWatchGuard: true,
     whitelistSubscriptionsByDefault: true,
@@ -28,13 +29,70 @@
     return cleaned.startsWith("@") ? cleaned : `@${cleaned}`;
   }
 
+  function normalizeChannelId(value) {
+    if (!value) return "";
+    return value.trim();
+  }
+
+  function normalizeRateLimitKey(key) {
+    if (!key) return "";
+    const text = String(key).trim();
+    if (!text) return "";
+
+    if (text.startsWith("id:")) {
+      const channelId = normalizeChannelId(text.slice(3));
+      return channelId ? `id:${channelId}` : "";
+    }
+
+    if (text.startsWith("handle:")) {
+      const handle = normalizeHandle(text.slice(7));
+      return handle ? `handle:${handle}` : "";
+    }
+
+    return "";
+  }
+
+  function normalizeRateLimitMinutes(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return null;
+
+    const minutes = Math.floor(num);
+    if (minutes < 1 || minutes > 1440) return null;
+    return minutes;
+  }
+
+  function normalizeRateLimitMap(raw) {
+    if (!raw || typeof raw !== "object") return {};
+
+    const normalized = {};
+    for (const [rawKey, rawValue] of Object.entries(raw)) {
+      const key = normalizeRateLimitKey(rawKey);
+      const minutes = normalizeRateLimitMinutes(rawValue);
+      if (!key || minutes === null) continue;
+      normalized[key] = minutes;
+    }
+    return normalized;
+  }
+
   function normalizeSettings(raw) {
     const merged = { ...DEFAULTS, ...(raw || {}) };
-    merged.channelIds = [...new Set((merged.channelIds || []).map((x) => (x || "").trim()).filter(Boolean))];
+    merged.version = 3;
+    merged.channelIds = [...new Set((merged.channelIds || []).map(normalizeChannelId).filter(Boolean))];
     merged.handles = [...new Set((merged.handles || []).map(normalizeHandle).filter(Boolean))];
+    merged.channelRateLimitsMinutesByKey = normalizeRateLimitMap(merged.channelRateLimitsMinutesByKey);
     merged.mode = merged.mode === "lenient" ? "lenient" : "strict";
     merged.whitelistSubscriptionsByDefault = merged.whitelistSubscriptionsByDefault !== false;
     return merged;
+  }
+
+  function toRateKeyFromChannelId(channelId) {
+    const normalized = normalizeChannelId(channelId);
+    return normalized ? `id:${normalized}` : "";
+  }
+
+  function toRateKeyFromHandle(handle) {
+    const normalized = normalizeHandle(handle);
+    return normalized ? `handle:${normalized}` : "";
   }
 
   async function getSettings() {
@@ -43,7 +101,7 @@
   }
 
   async function saveSettings(settings) {
-    await chrome.storage.sync.set({ [SETTINGS_KEY]: settings });
+    await chrome.storage.sync.set({ [SETTINGS_KEY]: normalizeSettings(settings) });
   }
 
   function setMessage(text, isError = false) {
@@ -114,6 +172,13 @@
       const handle = normalizeHandle(currentIdentity.handle);
       settings.handles = settings.handles.filter((h) => h !== handle);
     }
+
+    const nextRateLimits = { ...(settings.channelRateLimitsMinutesByKey || {}) };
+    const idKey = toRateKeyFromChannelId(currentIdentity.channelId || "");
+    const handleKey = toRateKeyFromHandle(currentIdentity.handle || "");
+    if (idKey) delete nextRateLimits[idKey];
+    if (handleKey) delete nextRateLimits[handleKey];
+    settings.channelRateLimitsMinutesByKey = nextRateLimits;
 
     await saveSettings(settings);
     await notifyActiveTabRefresh();

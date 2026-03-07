@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -41,6 +41,21 @@
     <section>
       <label for="handles">Whitelisted handles (one per line)</label>
       <textarea id="handles" rows="8" placeholder="@channelhandle"></textarea>
+    </section>
+
+    <section>
+      <label>Per-channel daily limits (minutes)</label>
+      <p class="muted">Leave blank for unlimited. Applies only to currently whitelisted channels.</p>
+      <table id="rateLimitsTable">
+        <thead>
+          <tr>
+            <th>Channel</th>
+            <th>Daily minutes</th>
+          </tr>
+        </thead>
+        <tbody id="rateLimitsBody"></tbody>
+      </table>
+      <p id="rateLimitsEmpty" class="muted" hidden>No whitelisted channels yet.</p>
     </section>
 
     <section class="inline-actions">
