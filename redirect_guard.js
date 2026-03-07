@@ -1,4 +1,4 @@
-﻿(() => {
+(() => {
   const SUBS_URL = "https://www.youtube.com/feed/subscriptions";
   const HIDE_STYLE_ID = "brightstream-short-block-style";
 
@@ -19,6 +19,10 @@
   function isRootPath(pathname) {
     const path = normalizePath(pathname || "");
     return path === "" || path === "/";
+  }
+
+  function isSubscriptionsPath(pathname) {
+    return normalizePath(pathname || "") === "/feed/subscriptions";
   }
 
   function shouldRedirectToSubs(url) {
@@ -44,7 +48,7 @@
       ensureShortsHidden();
     }
 
-    if (shouldRedirectToSubs(current) && current.href !== SUBS_URL) {
+    if (shouldRedirectToSubs(current) && !isSubscriptionsPath(current.pathname)) {
       window.location.replace(SUBS_URL);
       return;
     }

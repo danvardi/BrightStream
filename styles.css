@@ -37,6 +37,12 @@ button:hover {
   background: #f0f0f0;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  background: #f4f4f4;
+}
+
 .options main {
   max-width: 760px;
   margin: 0 auto;
@@ -102,3 +108,25 @@ select {
 #rateLimitsTable tr:last-child td {
   border-bottom: none;
 }
+
+#subscriptionActions {
+  margin: 6px 0 10px;
+}
+
+[data-sub-status-key] {
+  font-weight: 600;
+}
+
+[data-sub-status="subscribed"] {
+  color: #1b5e20;
+}
+
+[data-sub-status="not-subscribed"] {
+  color: #8d4b00;
+}
+
+[data-sub-status="unavailable"],
+[data-sub-status="error"] {
+  color: #b00020;
+}
+

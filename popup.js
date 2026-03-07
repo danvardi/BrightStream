@@ -139,6 +139,20 @@
     await chrome.tabs.sendMessage(tab.id, { type: "BRIGHTSTREAM_SETTINGS_UPDATED" }).catch(() => null);
   }
 
+  async function trySubscribeCurrentChannelOnActiveTab() {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs[0];
+    if (!tab || !tab.id || !tab.url || !tab.url.includes("youtube.com")) {
+      return { ok: false, reason: "tab-not-youtube" };
+    }
+
+    const response = await chrome.tabs.sendMessage(tab.id, {
+      type: "BRIGHTSTREAM_SUBSCRIBE_CURRENT_CHANNEL"
+    }).catch(() => null);
+
+    return response || { ok: false, reason: "no-response" };
+  }
+
   async function addCurrentChannel() {
     if (!currentIdentity || (!currentIdentity.channelId && !currentIdentity.handle)) {
       setMessage("No channel found on this page.", true);
@@ -154,7 +168,19 @@
     }
 
     await saveSettings(settings);
+    const subscribeResult = await trySubscribeCurrentChannelOnActiveTab();
     await notifyActiveTabRefresh();
+
+    if (subscribeResult?.subscribed) {
+      setMessage("Channel added to whitelist and subscribed on YouTube.");
+      return;
+    }
+
+    if (subscribeResult?.alreadySubscribed) {
+      setMessage("Channel added to whitelist. Already subscribed on YouTube.");
+      return;
+    }
+
     setMessage("Channel added to whitelist.");
   }
 
@@ -202,3 +228,4 @@
 
   init().catch((err) => setMessage(err.message || "Popup init failed.", true));
 })();
+

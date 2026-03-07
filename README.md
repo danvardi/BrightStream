@@ -9,8 +9,8 @@ BrightStream is a Manifest V3 Chrome extension that turns YouTube into a whiteli
 - Filters video tiles and recommendations so only whitelisted channels remain.
 - Enforces watch-page guard: blocked channels are redirected away.
 - Supports per-channel daily watch limits (minutes/day) for whitelisted channels.
-- Popup actions to add/remove the current channel.
-- Options page to edit whitelist and import/export JSON.
+- Popup actions to add/remove the current channel, with best-effort YouTube subscribe when adding.
+- Options page to edit whitelist, import/export JSON, and manage whitelist subscriptions (status, per-channel subscribe, subscribe-all).
 
 ## Files
 
@@ -74,3 +74,4 @@ Daily usage counters are stored locally in `chrome.storage.local` under `ytRateU
    - recommendation side videos from that channel are removed,
    - subscriptions feed tiles from that channel are removed until next day.
 4. Verify non-whitelisted channels are still blocked as before.
+

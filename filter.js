@@ -223,6 +223,11 @@
     return getPathname().startsWith("/feed/subscriptions");
   }
 
+  function isHomePage() {
+    const path = getPathname();
+    return path === "" || path === "/";
+  }
+
   function setWatchGuardHidden(hidden) {
     const existing = document.getElementById(WATCH_GUARD_HIDE_STYLE_ID);
     if (hidden) {
@@ -664,6 +669,20 @@
     forceFilterRecommendations();
   }
 
+  function getCurrentPageIdentity() {
+    if (isWatchPage()) {
+      return extractCurrentWatchIdentity();
+    }
+
+    const pathname = getPathname();
+    const fromPath = extractIdentityFromUrl(pathname);
+    if ((fromPath && fromPath.channelId) || (fromPath && fromPath.handle)) {
+      return fromPath;
+    }
+
+    return null;
+  }
+
   async function bootstrapSubscriptionsWhitelist() {
     if (!settings.whitelistSubscriptionsByDefault || !isSubscriptionsPage()) return;
 
@@ -1028,6 +1047,11 @@
     persistRateUsage(true).catch((err) => log("Persist on route change failed", err));
     clearExemptPlaybackIfVideoChanged();
 
+    if (isHomePage()) {
+      redirectToSubscriptions();
+      return;
+    }
+
     if (shouldBlockByPath()) {
       redirectToSubscriptions();
       return;
@@ -1051,18 +1075,212 @@
     forceFilterRecommendations();
   }
 
-  function getCurrentPageIdentity() {
-    if (isWatchPage()) {
-      return extractCurrentWatchIdentity();
+  function toBooleanLike(value) {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === "true" || normalized === "1") return true;
+      if (normalized === "false" || normalized === "0") return false;
     }
-
-    const pathname = getPathname();
-    const fromPath = extractIdentityFromUrl(pathname);
-    if ((fromPath && fromPath.channelId) || (fromPath && fromPath.handle)) {
-      return fromPath;
-    }
-
     return null;
+  }
+
+  function getSubscribeButtonState(button) {
+    try {
+      if (!(button instanceof HTMLElement)) return "unknown";
+
+      const host = button.closest("ytd-subscribe-button-renderer, yt-subscribe-button-view-model, ytm-subscribe-button-renderer");
+
+      if (button.matches("[disabled], [aria-disabled='true']") || button.closest("[disabled], [aria-disabled='true']")) {
+        return "disabled";
+      }
+
+      const pressedRaw =
+        button.getAttribute("aria-pressed") ||
+        host?.getAttribute("aria-pressed") ||
+        button.closest("[aria-pressed]")?.getAttribute("aria-pressed") ||
+        "";
+
+      const pressed = toBooleanLike(pressedRaw);
+      if (pressed === true) return "already-subscribed";
+      if (pressed === false) return "ready-to-subscribe";
+
+      if (host instanceof HTMLElement) {
+        const subscribedAttr = host.getAttribute("subscribed");
+        const parsedSubscribed = toBooleanLike(subscribedAttr || "");
+        if (parsedSubscribed === true) return "already-subscribed";
+        if (parsedSubscribed === false) return "ready-to-subscribe";
+
+        if (host.hasAttribute("subscribed") && !(subscribedAttr || "").trim()) {
+          return "already-subscribed";
+        }
+
+        const isSubscribedAttr = host.getAttribute("is-subscribed");
+        const parsedIsSubscribed = toBooleanLike(isSubscribedAttr || "");
+        if (parsedIsSubscribed === true) return "already-subscribed";
+        if (parsedIsSubscribed === false) return "ready-to-subscribe";
+      }
+
+      const text = [
+        button.getAttribute("aria-label") || "",
+        button.getAttribute("title") || "",
+        button.textContent || ""
+      ].join(" ").toLowerCase();
+
+      if (text.includes("subscribed") || text.includes("unsubscribe")) {
+        return "already-subscribed";
+      }
+      if (text.includes("subscribe")) {
+        return "ready-to-subscribe";
+      }
+
+      return "unknown";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  function getSubscribeActionElement(node) {
+    if (!(node instanceof HTMLElement)) return null;
+
+    if (node.matches("button, tp-yt-paper-button, [role='button']")) {
+      return node;
+    }
+
+    const nested = node.querySelector("button, tp-yt-paper-button, [role='button']");
+    return nested instanceof HTMLElement ? nested : node;
+  }
+
+  function findBestSubscribeButton() {
+    const selectors = [
+      "ytd-subscribe-button-renderer button",
+      "ytd-subscribe-button-renderer tp-yt-paper-button",
+      "yt-subscribe-button-view-model button",
+      "ytm-subscribe-button-renderer button",
+      "ytd-subscribe-button-renderer",
+      "yt-subscribe-button-view-model",
+      "ytm-subscribe-button-renderer"
+    ];
+
+    const candidates = [];
+    for (const selector of selectors) {
+      document.querySelectorAll(selector).forEach((node) => {
+        const actionEl = getSubscribeActionElement(node);
+        if (actionEl instanceof HTMLElement && actionEl.isConnected) {
+          candidates.push(actionEl);
+        }
+      });
+    }
+
+    const unique = [...new Set(candidates)];
+    let disabledMatch = null;
+    let unknownMatch = null;
+
+    for (const button of unique) {
+      const state = getSubscribeButtonState(button);
+
+      if (state === "ready-to-subscribe" || state === "already-subscribed") {
+        return { button, state };
+      }
+
+      if (state === "disabled" && !disabledMatch) {
+        disabledMatch = { button, state };
+      }
+
+      if (state === "unknown" && !unknownMatch) {
+        unknownMatch = { button, state };
+      }
+    }
+
+    return disabledMatch || unknownMatch || null;
+  }
+
+  async function findSubscribeButtonWithRetry(timeoutMs = 1800, intervalMs = 120) {
+    const startedAt = Date.now();
+    let disabledMatch = null;
+    let unknownMatch = null;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const match = findBestSubscribeButton();
+      if (match) {
+        if (match.state === "ready-to-subscribe" || match.state === "already-subscribed") {
+          return match;
+        }
+
+        if (match.state === "disabled" && !disabledMatch) {
+          disabledMatch = match;
+        }
+
+        if (match.state === "unknown" && !unknownMatch) {
+          unknownMatch = match;
+        }
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+
+    return disabledMatch || unknownMatch || null;
+  }
+  async function getCurrentSubscribeState() {
+    const identity = getCurrentPageIdentity();
+    const hasIdentity = Boolean(identity && (identity.channelId || identity.handle));
+
+    const match = await findSubscribeButtonWithRetry();
+    if (!match) {
+      return { ok: true, state: hasIdentity ? "button-not-found" : "no-channel" };
+    }
+
+    if (match.state === "already-subscribed") {
+      return { ok: true, state: "subscribed" };
+    }
+
+    if (match.state === "ready-to-subscribe") {
+      return { ok: true, state: "not-subscribed" };
+    }
+
+    if (match.state === "disabled") {
+      return { ok: true, state: "disabled" };
+    }
+
+    return { ok: true, state: "button-not-found" };
+  }
+
+  async function subscribeCurrentPageChannel() {
+    const identity = getCurrentPageIdentity();
+    if (!identity || (!identity.channelId && !identity.handle)) {
+      return { ok: false, reason: "no-channel" };
+    }
+
+    const match = await findSubscribeButtonWithRetry();
+    if (!match) {
+      return { ok: false, reason: "subscribe-button-not-found" };
+    }
+
+    if (match.state === "disabled") {
+      return { ok: false, reason: "disabled" };
+    }
+
+    if (match.state === "already-subscribed") {
+      return { ok: true, alreadySubscribed: true };
+    }
+
+    match.button.click();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const afterState = await getCurrentSubscribeState();
+    if (afterState.state === "subscribed") {
+      return { ok: true, subscribed: true };
+    }
+
+    if (afterState.state === "disabled") {
+      return { ok: false, reason: "disabled" };
+    }
+
+    if (afterState.state === "not-subscribed") {
+      return { ok: false, reason: "subscribe-did-not-stick" };
+    }
+
+    return { ok: false, reason: "subscribe-button-not-found" };
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -1078,6 +1296,20 @@
         onRouteChange();
         sendResponse({ ok: true });
       });
+      return true;
+    }
+
+    if (message.type === "BRIGHTSTREAM_GET_CURRENT_SUBSCRIBE_STATE") {
+      getCurrentSubscribeState()
+        .then((result) => sendResponse(result))
+        .catch(() => sendResponse({ ok: false, state: "button-not-found" }));
+      return true;
+    }
+
+    if (message.type === "BRIGHTSTREAM_SUBSCRIBE_CURRENT_CHANNEL") {
+      subscribeCurrentPageChannel()
+        .then((result) => sendResponse(result))
+        .catch(() => sendResponse({ ok: false, reason: "subscribe-failed" }));
       return true;
     }
   });
@@ -1100,6 +1332,11 @@
       setWatchGuardHidden(true);
     }
 
+
+    if (isHomePage()) {
+      redirectToSubscriptions();
+      return;
+    }
     await Promise.all([loadSettings(), loadRateUsage()]);
 
     if (shouldBlockByPath()) {
@@ -1146,3 +1383,7 @@
     getCurrentPageIdentity
   };
 })();
+
+
+
+

@@ -46,11 +46,18 @@
     <section>
       <label>Per-channel daily limits (minutes)</label>
       <p class="muted">Leave blank for unlimited. Applies only to currently whitelisted channels.</p>
+      <div class="inline-actions" id="subscriptionActions">
+        <button id="refreshSubscriptionStatusBtn" type="button">Refresh subscription statuses</button>
+        <button id="subscribeAllBtn" type="button">Subscribe all not subscribed</button>
+        <button id="cancelSubscriptionRunBtn" type="button" hidden>Stop run</button>
+      </div>
       <table id="rateLimitsTable">
         <thead>
           <tr>
             <th>Channel</th>
             <th>Daily minutes</th>
+            <th>Subscription status</th>
+            <th>Action</th>
           </tr>
         </thead>
         <tbody id="rateLimitsBody"></tbody>
@@ -70,3 +77,4 @@
   <script src="options.js"></script>
 </body>
 </html>
+
