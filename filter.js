@@ -265,10 +265,29 @@
 
   function shouldBlockByPath() {
     const path = getPathname();
-    if (!settings.blockShorts) return false;
-    const isShortsPath = path === "/shorts" || path.startsWith("/shorts/");
-    const isSubscriptionsShorts = path === "/feed/subscriptions/shorts" || path.startsWith("/feed/subscriptions/shorts/");
-    return isShortsPath || isSubscriptionsShorts;
+    const normalizedPath = normalizePathname(path);
+    const segments = normalizedPath.split("/").filter(Boolean);
+
+    if (settings.blockShorts) {
+      const isShortsPath = normalizedPath === "/shorts" || normalizedPath.startsWith("/shorts/");
+      const isSubscriptionsShorts = normalizedPath === "/feed/subscriptions/shorts" || normalizedPath.startsWith("/feed/subscriptions/shorts/");
+      if (isShortsPath || isSubscriptionsShorts) {
+        return true;
+      }
+    }
+
+    const isHandleChannelRoot = segments.length === 1 && segments[0]?.startsWith("@");
+    const isChannelIdRoot = segments.length === 2 && segments[0] === "channel";
+    if (!isHandleChannelRoot && !isChannelIdRoot) {
+      return false;
+    }
+
+    const identity = extractIdentityFromUrl(normalizedPath);
+    if (!identity || (!identity.channelId && !identity.handle)) {
+      return true;
+    }
+
+    return !isWhitelisted(identity);
   }
 
   function redirectToSubscriptions() {
