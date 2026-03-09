@@ -1,11 +1,20 @@
 (() => {
   const SETTINGS_KEY = "ytWhitelistSettings";
+  const DEFAULT_OPEN_GROUP_ID = "open";
+  const DEFAULT_RATE_LIMIT_GROUPS = Object.freeze({
+    open: Object.freeze({ name: "Open", minutes: null }),
+    "30min": Object.freeze({ name: "30 min", minutes: 30 }),
+    "60min": Object.freeze({ name: "60 min", minutes: 60 })
+  });
+  const RESERVED_GROUP_IDS = new Set(Object.keys(DEFAULT_RATE_LIMIT_GROUPS));
+
   const DEFAULTS = {
-    version: 3,
+    version: 4,
     mode: "strict",
     channelIds: [],
     handles: [],
-    channelRateLimitsMinutesByKey: {},
+    rateLimitGroupsById: {},
+    channelRateLimitGroupByKey: {},
     blockShorts: true,
     enforceWatchGuard: true,
     whitelistSubscriptionsByDefault: true,
@@ -37,6 +46,9 @@
   const rateLimitsBodyEl = document.getElementById("rateLimitsBody");
   const rateLimitsTableEl = document.getElementById("rateLimitsTable");
   const rateLimitsEmptyEl = document.getElementById("rateLimitsEmpty");
+  const rateLimitGroupsBodyEl = document.getElementById("rateLimitGroupsBody");
+  const rateLimitGroupsEmptyEl = document.getElementById("rateLimitGroupsEmpty");
+  const addRateLimitGroupBtnEl = document.getElementById("addRateLimitGroupBtn");
   const refreshSubscriptionStatusBtnEl = document.getElementById("refreshSubscriptionStatusBtn");
   const subscribeAllBtnEl = document.getElementById("subscribeAllBtn");
   const cancelSubscriptionRunBtnEl = document.getElementById("cancelSubscriptionRunBtn");
@@ -81,6 +93,7 @@
   }
 
   function normalizeRateLimitMinutes(value) {
+    if (value === null) return null;
     const num = Number(value);
     if (!Number.isFinite(num)) return null;
 
@@ -99,6 +112,70 @@
       if (!key || minutes === null) continue;
       normalized[key] = minutes;
     }
+    return normalized;
+  }
+
+  function normalizeRateLimitGroupId(value) {
+    if (!value) return "";
+    return String(value)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/[^a-z0-9_-]/g, "");
+  }
+
+  function normalizeGroupName(value, fallbackMinutes = null) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (text) return text;
+    if (fallbackMinutes === null) return "Open";
+    return `${fallbackMinutes} min`;
+  }
+
+  function getDefaultRateLimitGroups() {
+    return {
+      open: { name: DEFAULT_RATE_LIMIT_GROUPS.open.name, minutes: null },
+      "30min": { name: DEFAULT_RATE_LIMIT_GROUPS["30min"].name, minutes: 30 },
+      "60min": { name: DEFAULT_RATE_LIMIT_GROUPS["60min"].name, minutes: 60 }
+    };
+  }
+
+  function isDefaultGroupId(groupId) {
+    return RESERVED_GROUP_IDS.has(groupId);
+  }
+
+  function normalizeRateLimitGroups(raw) {
+    const normalized = getDefaultRateLimitGroups();
+    if (!raw || typeof raw !== "object") return normalized;
+
+    for (const [rawGroupId, rawGroup] of Object.entries(raw)) {
+      const groupId = normalizeRateLimitGroupId(rawGroupId);
+      if (!groupId || RESERVED_GROUP_IDS.has(groupId)) continue;
+      if (!rawGroup || typeof rawGroup !== "object") continue;
+
+      const minutes = normalizeRateLimitMinutes(rawGroup.minutes);
+      if (minutes === null && rawGroup.minutes !== null) continue;
+
+      normalized[groupId] = {
+        name: normalizeGroupName(rawGroup.name, minutes),
+        minutes
+      };
+    }
+
+    return normalized;
+  }
+
+  function normalizeChannelRateLimitGroupMap(raw, validGroupIds) {
+    if (!raw || typeof raw !== "object") return {};
+    const normalized = {};
+
+    for (const [rawKey, rawGroupId] of Object.entries(raw)) {
+      const key = normalizeRateLimitKey(rawKey);
+      const groupId = normalizeRateLimitGroupId(rawGroupId);
+      if (!key || !groupId) continue;
+      if (validGroupIds && !validGroupIds.has(groupId)) continue;
+      normalized[key] = groupId;
+    }
+
     return normalized;
   }
 
@@ -138,21 +215,127 @@
     return key;
   }
 
+  function labelForGroup(groupId, group) {
+    if (!group) return groupId;
+    if (group.minutes === null) return `${group.name} (Unlimited)`;
+    return `${group.name} (${group.minutes} min)`;
+  }
+
+  function findGroupIdByMinutes(groupsById, minutes) {
+    for (const [groupId, group] of Object.entries(groupsById || {})) {
+      if (group && group.minutes === minutes) {
+        return groupId;
+      }
+    }
+    return "";
+  }
+
+  function makeUniqueCustomGroupId(baseId, groupsById) {
+    const normalizedBase = normalizeRateLimitGroupId(baseId) || "group";
+    if (!groupsById[normalizedBase]) return normalizedBase;
+
+    let suffix = 2;
+    while (groupsById[`${normalizedBase}-${suffix}`]) {
+      suffix += 1;
+    }
+    return `${normalizedBase}-${suffix}`;
+  }
+
+  function applyLegacyRateLimitGroupAssignments(groupsById, groupByKey, legacyLimitMap, allowedKeys) {
+    const nextGroupsById = { ...(groupsById || {}) };
+    const nextGroupByKey = { ...(groupByKey || {}) };
+
+    for (const [key, minutes] of Object.entries(legacyLimitMap || {})) {
+      if (allowedKeys && !allowedKeys.has(key)) continue;
+      if (nextGroupByKey[key]) continue;
+
+      let groupId = findGroupIdByMinutes(nextGroupsById, minutes);
+      if (!groupId) {
+        const baseId = `${minutes}min`;
+        groupId = makeUniqueCustomGroupId(baseId, nextGroupsById);
+        nextGroupsById[groupId] = {
+          name: `${minutes} min`,
+          minutes
+        };
+      }
+      nextGroupByKey[key] = groupId;
+    }
+
+    return { groupsById: nextGroupsById, groupByKey: nextGroupByKey };
+  }
+
+  function getOrderedGroupEntries(groupsById) {
+    const entries = [];
+    ["open", "30min", "60min"].forEach((groupId) => {
+      const group = groupsById[groupId];
+      if (group) {
+        entries.push([groupId, group]);
+      }
+    });
+
+    const custom = Object.entries(groupsById)
+      .filter(([groupId]) => !RESERVED_GROUP_IDS.has(groupId))
+      .sort((a, b) => a[0].localeCompare(b[0]));
+
+    return [...entries, ...custom];
+  }
+
   function normalizeSettings(raw) {
     const merged = { ...DEFAULTS, ...(raw || {}) };
-    merged.version = 3;
+    merged.version = 4;
     merged.channelIds = [...new Set((merged.channelIds || []).map(normalizeChannelId).filter(Boolean))];
     merged.handles = [...new Set((merged.handles || []).map(normalizeHandle).filter(Boolean))];
-    merged.channelRateLimitsMinutesByKey = normalizeRateLimitMap(merged.channelRateLimitsMinutesByKey);
     merged.mode = merged.mode === "lenient" ? "lenient" : "strict";
     merged.whitelistSubscriptionsByDefault = merged.whitelistSubscriptionsByDefault !== false;
+    merged.rateLimitGroupsById = normalizeRateLimitGroups(merged.rateLimitGroupsById);
 
-    const allowedKeys = new Set(getWhitelistRateLimitKeys(merged.channelIds, merged.handles));
-    merged.channelRateLimitsMinutesByKey = Object.fromEntries(
-      Object.entries(merged.channelRateLimitsMinutesByKey).filter(([key]) => allowedKeys.has(key))
+    const validGroupIds = new Set(Object.keys(merged.rateLimitGroupsById));
+    merged.channelRateLimitGroupByKey = normalizeChannelRateLimitGroupMap(
+      merged.channelRateLimitGroupByKey,
+      validGroupIds
     );
 
+    const allowedKeys = new Set(getWhitelistRateLimitKeys(merged.channelIds, merged.handles));
+    merged.channelRateLimitGroupByKey = Object.fromEntries(
+      Object.entries(merged.channelRateLimitGroupByKey).filter(([key]) => allowedKeys.has(key))
+    );
+
+    const legacyMap = normalizeRateLimitMap(merged.channelRateLimitsMinutesByKey);
+    if (Object.keys(legacyMap).length > 0) {
+      const migrated = applyLegacyRateLimitGroupAssignments(
+        merged.rateLimitGroupsById,
+        merged.channelRateLimitGroupByKey,
+        legacyMap,
+        allowedKeys
+      );
+      merged.rateLimitGroupsById = migrated.groupsById;
+      merged.channelRateLimitGroupByKey = migrated.groupByKey;
+    }
+
+    for (const key of allowedKeys) {
+      if (!merged.channelRateLimitGroupByKey[key]) {
+        merged.channelRateLimitGroupByKey[key] = DEFAULT_OPEN_GROUP_ID;
+      }
+    }
+
+    delete merged.channelRateLimitsMinutesByKey;
     return merged;
+  }
+
+  function isLegacyImportPayload(raw) {
+    if (!raw || typeof raw !== "object") return false;
+    const hasLegacy = Boolean(raw.channelRateLimitsMinutesByKey && typeof raw.channelRateLimitsMinutesByKey === "object");
+    const hasGroups = Boolean(raw.rateLimitGroupsById || raw.channelRateLimitGroupByKey);
+    return hasLegacy && !hasGroups;
+  }
+
+  function normalizeLegacyImport(raw, existingSettings) {
+    return normalizeSettings({
+      ...raw,
+      version: 4,
+      rateLimitGroupsById: { ...(existingSettings.rateLimitGroupsById || {}) },
+      channelRateLimitGroupByKey: {}
+    });
   }
 
   async function getSettings() {
@@ -191,8 +374,8 @@
   }
 
   function getCurrentTableKeys() {
-    return [...rateLimitsBodyEl.querySelectorAll("input[data-rate-key]")]
-      .map((input) => normalizeRateLimitKey(input.dataset.rateKey || ""))
+    return [...rateLimitsBodyEl.querySelectorAll("select[data-channel-key]")]
+      .map((select) => normalizeRateLimitKey(select.dataset.channelKey || ""))
       .filter(Boolean);
   }
 
@@ -232,11 +415,11 @@
 
   function collectRateLimitDraftValues() {
     const draft = {};
-    rateLimitsBodyEl.querySelectorAll("input[data-rate-key]").forEach((input) => {
-      const key = normalizeRateLimitKey(input.dataset.rateKey || "");
-      const value = (input.value || "").trim();
-      if (!key || !value) return;
-      draft[key] = value;
+    rateLimitsBodyEl.querySelectorAll("select[data-channel-key]").forEach((select) => {
+      const key = normalizeRateLimitKey(select.dataset.channelKey || "");
+      const groupId = normalizeRateLimitGroupId(select.value || DEFAULT_OPEN_GROUP_ID);
+      if (!key) return;
+      draft[key] = groupId || DEFAULT_OPEN_GROUP_ID;
     });
     return draft;
   }
@@ -246,6 +429,49 @@
       channelIds: parseLines(channelIdsEl.value, normalizeChannelId),
       handles: parseLines(handlesEl.value, normalizeHandle)
     };
+  }
+
+  function readRateLimitGroupsFromDom({ strict = false } = {}) {
+    const groupsById = getDefaultRateLimitGroups();
+
+    if (!rateLimitGroupsBodyEl) return groupsById;
+
+    rateLimitGroupsBodyEl.querySelectorAll("tr[data-group-id]").forEach((row) => {
+      const groupId = normalizeRateLimitGroupId(row.dataset.groupId || "");
+      if (!groupId || isDefaultGroupId(groupId)) return;
+
+      const nameInput = row.querySelector(`input[data-group-name-id="${CSS.escape(groupId)}"]`);
+      const minutesInput = row.querySelector(`input[data-group-minutes-id="${CSS.escape(groupId)}"]`);
+
+      const rawName = typeof nameInput?.value === "string" ? nameInput.value : "";
+      const rawMinutes = (minutesInput?.value || "").trim();
+      const minutes = normalizeRateLimitMinutes(rawMinutes);
+
+      if (minutes === null) {
+        if (strict) {
+          throw new Error(`Invalid minutes for group ${groupId}. Use 1-1440.`);
+        }
+
+        const fallback = normalizeRateLimitMinutes(minutesInput?.dataset.lastValidMinutes || "");
+        if (fallback === null) return;
+        groupsById[groupId] = {
+          name: normalizeGroupName(rawName, fallback),
+          minutes: fallback
+        };
+        return;
+      }
+
+      if (minutesInput) {
+        minutesInput.dataset.lastValidMinutes = String(minutes);
+      }
+
+      groupsById[groupId] = {
+        name: normalizeGroupName(rawName, minutes),
+        minutes
+      };
+    });
+
+    return groupsById;
   }
 
   function renderSubscriptionRowState(key) {
@@ -301,12 +527,81 @@
     exportBtnEl.disabled = disabled;
     importBtnEl.disabled = disabled;
 
-    rateLimitsBodyEl.querySelectorAll("input[data-rate-key]").forEach((input) => {
-      input.disabled = disabled;
+    rateLimitsBodyEl.querySelectorAll("select[data-channel-key]").forEach((select) => {
+      select.disabled = disabled;
     });
+
+    if (rateLimitGroupsBodyEl) {
+      rateLimitGroupsBodyEl.querySelectorAll("input,button").forEach((node) => {
+        node.disabled = disabled;
+      });
+    }
+
+    if (addRateLimitGroupBtnEl) {
+      addRateLimitGroupBtnEl.disabled = disabled;
+    }
   }
 
-  function renderRateLimitRows(channelIds, handles, valueMap = {}) {
+  function renderRateLimitGroups(groupsById) {
+    if (!rateLimitGroupsBodyEl) return;
+
+    const entries = getOrderedGroupEntries(groupsById);
+    rateLimitGroupsBodyEl.innerHTML = "";
+
+    entries.forEach(([groupId, group]) => {
+      const tr = document.createElement("tr");
+      tr.dataset.groupId = groupId;
+
+      const nameTd = document.createElement("td");
+      const nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.dataset.groupNameId = groupId;
+      nameInput.value = group.name;
+      nameInput.disabled = isDefaultGroupId(groupId);
+      nameTd.appendChild(nameInput);
+
+      const minutesTd = document.createElement("td");
+      if (group.minutes === null) {
+        const span = document.createElement("span");
+        span.textContent = "Unlimited";
+        minutesTd.appendChild(span);
+      } else {
+        const minutesInput = document.createElement("input");
+        minutesInput.type = "number";
+        minutesInput.min = "1";
+        minutesInput.max = "1440";
+        minutesInput.step = "1";
+        minutesInput.dataset.groupMinutesId = groupId;
+        minutesInput.dataset.lastValidMinutes = String(group.minutes);
+        minutesInput.value = String(group.minutes);
+        minutesInput.disabled = isDefaultGroupId(groupId);
+        minutesTd.appendChild(minutesInput);
+      }
+
+      const actionTd = document.createElement("td");
+      if (isDefaultGroupId(groupId)) {
+        actionTd.textContent = "Default";
+      } else {
+        const deleteBtn = document.createElement("button");
+        deleteBtn.type = "button";
+        deleteBtn.dataset.deleteGroupId = groupId;
+        deleteBtn.textContent = "Delete";
+        actionTd.appendChild(deleteBtn);
+      }
+
+      tr.appendChild(nameTd);
+      tr.appendChild(minutesTd);
+      tr.appendChild(actionTd);
+      rateLimitGroupsBodyEl.appendChild(tr);
+    });
+
+    if (rateLimitGroupsEmptyEl) {
+      const hasCustom = Object.keys(groupsById).some((groupId) => !isDefaultGroupId(groupId));
+      rateLimitGroupsEmptyEl.hidden = hasCustom;
+    }
+  }
+
+  function renderRateLimitRows(channelIds, handles, assignmentMap = {}, groupsById = getDefaultRateLimitGroups()) {
     const keys = getWhitelistRateLimitKeys(channelIds, handles);
     syncSubscriptionStatusKeys(keys);
 
@@ -322,25 +617,28 @@
     rateLimitsTableEl.hidden = false;
     rateLimitsEmptyEl.hidden = true;
 
+    const groupEntries = getOrderedGroupEntries(groupsById);
+
     keys.forEach((key) => {
       const tr = document.createElement("tr");
 
       const labelTd = document.createElement("td");
       labelTd.textContent = labelForRateLimitKey(key);
 
-      const inputTd = document.createElement("td");
-      const input = document.createElement("input");
-      input.type = "number";
-      input.min = "1";
-      input.max = "1440";
-      input.step = "1";
-      input.placeholder = "Unlimited";
-      input.dataset.rateKey = key;
-      const rawValue = valueMap[key];
-      if (rawValue !== undefined && rawValue !== null && rawValue !== "") {
-        input.value = String(rawValue);
-      }
-      inputTd.appendChild(input);
+      const groupTd = document.createElement("td");
+      const select = document.createElement("select");
+      select.dataset.channelKey = key;
+
+      groupEntries.forEach(([groupId, group]) => {
+        const option = document.createElement("option");
+        option.value = groupId;
+        option.textContent = labelForGroup(groupId, group);
+        select.appendChild(option);
+      });
+
+      const assignedGroup = normalizeRateLimitGroupId(assignmentMap[key]) || DEFAULT_OPEN_GROUP_ID;
+      select.value = groupsById[assignedGroup] ? assignedGroup : DEFAULT_OPEN_GROUP_ID;
+      groupTd.appendChild(select);
 
       const statusTd = document.createElement("td");
       const statusNode = document.createElement("span");
@@ -354,7 +652,7 @@
       actionTd.appendChild(actionButton);
 
       tr.appendChild(labelTd);
-      tr.appendChild(inputTd);
+      tr.appendChild(groupTd);
       tr.appendChild(statusTd);
       tr.appendChild(actionTd);
       rateLimitsBodyEl.appendChild(tr);
@@ -366,36 +664,28 @@
   }
 
   function rerenderRateLimitsFromDraft() {
-    const draftValues = collectRateLimitDraftValues();
+    const draftAssignments = collectRateLimitDraftValues();
+    const groupsById = readRateLimitGroupsFromDom({ strict: false });
     const draftWhitelist = getWhitelistDraftFromForm();
-    renderRateLimitRows(draftWhitelist.channelIds, draftWhitelist.handles, draftValues);
+    renderRateLimitRows(draftWhitelist.channelIds, draftWhitelist.handles, draftAssignments, groupsById);
   }
 
-  function render(settings) {
-    modeEl.value = settings.mode;
-    blockShortsEl.checked = settings.blockShorts;
-    enforceWatchGuardEl.checked = settings.enforceWatchGuard;
-    whitelistSubscriptionsEl.checked = settings.whitelistSubscriptionsByDefault;
-    channelIdsEl.value = settings.channelIds.join("\n");
-    handlesEl.value = settings.handles.join("\n");
-    renderRateLimitRows(settings.channelIds, settings.handles, settings.channelRateLimitsMinutesByKey);
+  function rerenderAllFromDraft() {
+    const draftAssignments = collectRateLimitDraftValues();
+    const draftWhitelist = getWhitelistDraftFromForm();
+    const groupsById = readRateLimitGroupsFromDom({ strict: false });
+
+    renderRateLimitGroups(groupsById);
+    renderRateLimitRows(draftWhitelist.channelIds, draftWhitelist.handles, draftAssignments, groupsById);
   }
 
-  function collectRateLimitsForKeys(allowedKeys) {
+  function collectChannelGroupAssignments(allowedKeys, groupsById) {
     const values = {};
 
     allowedKeys.forEach((key) => {
-      const input = rateLimitsBodyEl.querySelector(`input[data-rate-key="${CSS.escape(key)}"]`);
-      if (!input) return;
-
-      const rawValue = (input.value || "").trim();
-      if (!rawValue) return;
-
-      const minutes = normalizeRateLimitMinutes(rawValue);
-      if (minutes === null) {
-        throw new Error(`Invalid daily minutes for ${labelForRateLimitKey(key)}. Use 1-1440.`);
-      }
-      values[key] = minutes;
+      const select = rateLimitsBodyEl.querySelector(`select[data-channel-key="${CSS.escape(key)}"]`);
+      const selectedGroupId = normalizeRateLimitGroupId(select?.value || "") || DEFAULT_OPEN_GROUP_ID;
+      values[key] = groupsById[selectedGroupId] ? selectedGroupId : DEFAULT_OPEN_GROUP_ID;
     });
 
     return values;
@@ -405,17 +695,71 @@
     const channelIds = parseLines(channelIdsEl.value, normalizeChannelId);
     const handles = parseLines(handlesEl.value, normalizeHandle);
     const allowedKeys = getWhitelistRateLimitKeys(channelIds, handles);
+    const rateLimitGroupsById = readRateLimitGroupsFromDom({ strict: true });
 
     return normalizeSettings({
-      version: 3,
+      version: 4,
       mode: modeEl.value,
       blockShorts: blockShortsEl.checked,
       enforceWatchGuard: enforceWatchGuardEl.checked,
       whitelistSubscriptionsByDefault: whitelistSubscriptionsEl.checked,
       channelIds,
       handles,
-      channelRateLimitsMinutesByKey: collectRateLimitsForKeys(allowedKeys)
+      rateLimitGroupsById,
+      channelRateLimitGroupByKey: collectChannelGroupAssignments(allowedKeys, rateLimitGroupsById)
     });
+  }
+
+  function render(settings) {
+    modeEl.value = settings.mode;
+    blockShortsEl.checked = settings.blockShorts;
+    enforceWatchGuardEl.checked = settings.enforceWatchGuard;
+    whitelistSubscriptionsEl.checked = settings.whitelistSubscriptionsByDefault;
+    channelIdsEl.value = settings.channelIds.join("\n");
+    handlesEl.value = settings.handles.join("\n");
+
+    renderRateLimitGroups(settings.rateLimitGroupsById);
+    renderRateLimitRows(
+      settings.channelIds,
+      settings.handles,
+      settings.channelRateLimitGroupByKey,
+      settings.rateLimitGroupsById
+    );
+  }
+
+  function addCustomRateLimitGroup() {
+    const groupsById = readRateLimitGroupsFromDom({ strict: false });
+    const nextId = makeUniqueCustomGroupId("custom", groupsById);
+    groupsById[nextId] = {
+      name: "Custom",
+      minutes: 15
+    };
+
+    const draftAssignments = collectRateLimitDraftValues();
+    const draftWhitelist = getWhitelistDraftFromForm();
+
+    renderRateLimitGroups(groupsById);
+    renderRateLimitRows(draftWhitelist.channelIds, draftWhitelist.handles, draftAssignments, groupsById);
+  }
+
+  function deleteRateLimitGroup(groupId) {
+    const normalizedGroupId = normalizeRateLimitGroupId(groupId);
+    if (!normalizedGroupId || isDefaultGroupId(normalizedGroupId)) return;
+
+    const groupsById = readRateLimitGroupsFromDom({ strict: false });
+    if (!groupsById[normalizedGroupId]) return;
+    delete groupsById[normalizedGroupId];
+
+    const draftAssignments = collectRateLimitDraftValues();
+    Object.keys(draftAssignments).forEach((key) => {
+      if (draftAssignments[key] === normalizedGroupId) {
+        draftAssignments[key] = DEFAULT_OPEN_GROUP_ID;
+      }
+    });
+
+    const draftWhitelist = getWhitelistDraftFromForm();
+    renderRateLimitGroups(groupsById);
+    renderRateLimitRows(draftWhitelist.channelIds, draftWhitelist.handles, draftAssignments, groupsById);
   }
 
   function keyToChannelUrl(key) {
@@ -786,7 +1130,15 @@
   async function onImportFile(file) {
     const text = await file.text();
     const parsed = JSON.parse(text);
-    const normalized = normalizeSettings(parsed);
+
+    let normalized;
+    if (isLegacyImportPayload(parsed)) {
+      const existing = await getSettings();
+      normalized = normalizeLegacyImport(parsed, existing);
+    } else {
+      normalized = normalizeSettings(parsed);
+    }
+
     render(normalized);
     await saveSettings(normalized);
     setStatus("Imported and saved.");
@@ -843,11 +1195,27 @@
       });
     });
 
+    if (rateLimitGroupsBodyEl) {
+      rateLimitGroupsBodyEl.addEventListener("click", (event) => {
+        const button = event.target instanceof HTMLElement ? event.target.closest("button[data-delete-group-id]") : null;
+        if (!(button instanceof HTMLButtonElement)) return;
+        deleteRateLimitGroup(button.dataset.deleteGroupId || "");
+      });
+
+      rateLimitGroupsBodyEl.addEventListener("change", () => {
+        rerenderAllFromDraft();
+      });
+    }
+
+    if (addRateLimitGroupBtnEl) {
+      addRateLimitGroupBtnEl.addEventListener("click", () => {
+        addCustomRateLimitGroup();
+      });
+    }
+
     channelIdsEl.addEventListener("input", rerenderRateLimitsFromDraft);
     handlesEl.addEventListener("input", rerenderRateLimitsFromDraft);
   }
 
   init().catch((err) => setStatus(err.message || "Options init failed.", true));
 })();
-
-

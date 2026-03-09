@@ -1,8 +1,16 @@
 (() => {
   const SETTINGS_KEY = "ytWhitelistSettings";
-  const RATE_USAGE_KEY = "ytRateUsageDailyV1";
+  const RATE_USAGE_KEY = "ytRateUsageDailyV2";
+  const LEGACY_RATE_USAGE_KEY = "ytRateUsageDailyV1";
   const SUBS_URL = "https://www.youtube.com/feed/subscriptions";
   const WATCH_GUARD_HIDE_STYLE_ID = "brightstream-watch-guard-style";
+  const DEFAULT_OPEN_GROUP_ID = "open";
+  const DEFAULT_RATE_LIMIT_GROUPS = Object.freeze({
+    open: Object.freeze({ name: "Open", minutes: null }),
+    "30min": Object.freeze({ name: "30 min", minutes: 30 }),
+    "60min": Object.freeze({ name: "60 min", minutes: 60 })
+  });
+  const RESERVED_GROUP_IDS = new Set(Object.keys(DEFAULT_RATE_LIMIT_GROUPS));
   const TILE_SELECTORS = [
     "ytd-rich-item-renderer",
     "ytd-video-renderer",
@@ -18,11 +26,12 @@
   ];
 
   const DEFAULTS = {
-    version: 3,
+    version: 4,
     mode: "strict",
     channelIds: [],
     handles: [],
-    channelRateLimitsMinutesByKey: {},
+    rateLimitGroupsById: {},
+    channelRateLimitGroupByKey: {},
     blockShorts: true,
     enforceWatchGuard: true,
     whitelistSubscriptionsByDefault: true,
@@ -35,7 +44,7 @@
   const SEARCH_RESOLVE_MAX_RETRIES = 20;
 
   let settings = { ...DEFAULTS };
-  let rateUsage = { dayKey: "", secondsByKey: {} };
+  let rateUsage = { dayKey: "", secondsByGroupId: {} };
   let observer = null;
   let watchGuardTimer = null;
   let watchGuardProbeToken = 0;
@@ -48,7 +57,7 @@
   let playbackUsageDirty = false;
   let rateUsageFlushInFlight = null;
   let playbackVideoEl = null;
-  let exemptPlayback = { videoId: "", channelKey: "" };
+  let exemptPlayback = { videoId: "", groupId: "" };
   const recommendationIdentityCache = new Map();
   const recommendationResolveInFlight = new Set();
   const searchPendingTilesByVideoId = new Map();
@@ -90,7 +99,34 @@
     return "";
   }
 
+  function toRateKeyFromChannelId(channelId) {
+    const normalized = normalizeChannelId(channelId);
+    return normalized ? `id:${normalized}` : "";
+  }
+
+  function toRateKeyFromHandle(handle) {
+    const normalized = normalizeHandle(handle);
+    return normalized ? `handle:${normalized}` : "";
+  }
+
+  function getWhitelistRateLimitKeys(channelIds, handles) {
+    const keys = [];
+
+    for (const channelId of channelIds || []) {
+      const key = toRateKeyFromChannelId(channelId);
+      if (key) keys.push(key);
+    }
+
+    for (const handle of handles || []) {
+      const key = toRateKeyFromHandle(handle);
+      if (key) keys.push(key);
+    }
+
+    return [...new Set(keys)];
+  }
+
   function normalizeRateLimitMinutes(value) {
+    if (value === null) return null;
     const num = Number(value);
     if (!Number.isFinite(num)) return null;
 
@@ -112,6 +148,109 @@
     return normalized;
   }
 
+  function normalizeRateLimitGroupId(value) {
+    if (!value) return "";
+    return String(value)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/[^a-z0-9_-]/g, "");
+  }
+
+  function normalizeGroupName(value, fallbackMinutes = null) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (text) return text;
+    if (fallbackMinutes === null) return "Open";
+    return `${fallbackMinutes} min`;
+  }
+
+  function getDefaultRateLimitGroups() {
+    return {
+      open: { name: DEFAULT_RATE_LIMIT_GROUPS.open.name, minutes: null },
+      "30min": { name: DEFAULT_RATE_LIMIT_GROUPS["30min"].name, minutes: 30 },
+      "60min": { name: DEFAULT_RATE_LIMIT_GROUPS["60min"].name, minutes: 60 }
+    };
+  }
+
+  function normalizeRateLimitGroups(raw) {
+    const normalized = getDefaultRateLimitGroups();
+    if (!raw || typeof raw !== "object") return normalized;
+
+    for (const [rawGroupId, rawGroup] of Object.entries(raw)) {
+      const groupId = normalizeRateLimitGroupId(rawGroupId);
+      if (!groupId || RESERVED_GROUP_IDS.has(groupId)) continue;
+      if (!rawGroup || typeof rawGroup !== "object") continue;
+
+      const minutes = normalizeRateLimitMinutes(rawGroup.minutes);
+      if (minutes === null && rawGroup.minutes !== null) continue;
+
+      normalized[groupId] = {
+        name: normalizeGroupName(rawGroup.name, minutes),
+        minutes
+      };
+    }
+
+    return normalized;
+  }
+
+  function normalizeChannelRateLimitGroupMap(raw, validGroupIds) {
+    if (!raw || typeof raw !== "object") return {};
+    const normalized = {};
+
+    for (const [rawKey, rawGroupId] of Object.entries(raw)) {
+      const key = normalizeRateLimitKey(rawKey);
+      const groupId = normalizeRateLimitGroupId(rawGroupId);
+      if (!key || !groupId) continue;
+      if (validGroupIds && !validGroupIds.has(groupId)) continue;
+      normalized[key] = groupId;
+    }
+
+    return normalized;
+  }
+
+  function findGroupIdByMinutes(groupsById, minutes) {
+    for (const [groupId, group] of Object.entries(groupsById || {})) {
+      if (group && group.minutes === minutes) {
+        return groupId;
+      }
+    }
+    return "";
+  }
+
+  function makeUniqueCustomGroupId(baseId, groupsById) {
+    const normalizedBase = normalizeRateLimitGroupId(baseId) || "group";
+    if (!groupsById[normalizedBase]) return normalizedBase;
+
+    let suffix = 2;
+    while (groupsById[`${normalizedBase}-${suffix}`]) {
+      suffix += 1;
+    }
+    return `${normalizedBase}-${suffix}`;
+  }
+
+  function applyLegacyRateLimitGroupAssignments(groupsById, groupByKey, legacyLimitMap, allowedKeys) {
+    const nextGroupsById = { ...(groupsById || {}) };
+    const nextGroupByKey = { ...(groupByKey || {}) };
+
+    for (const [key, minutes] of Object.entries(legacyLimitMap || {})) {
+      if (allowedKeys && !allowedKeys.has(key)) continue;
+      if (nextGroupByKey[key]) continue;
+
+      let groupId = findGroupIdByMinutes(nextGroupsById, minutes);
+      if (!groupId) {
+        const baseId = `${minutes}min`;
+        groupId = makeUniqueCustomGroupId(baseId, nextGroupsById);
+        nextGroupsById[groupId] = {
+          name: `${minutes} min`,
+          minutes
+        };
+      }
+      nextGroupByKey[key] = groupId;
+    }
+
+    return { groupsById: nextGroupsById, groupByKey: nextGroupByKey };
+  }
+
   function getLocalDayKey(date = new Date()) {
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -119,7 +258,7 @@
     return `${year}-${month}-${day}`;
   }
 
-  function normalizeRateUsage(raw) {
+  function normalizeLegacyRateUsage(raw) {
     const today = getLocalDayKey();
     const next = {
       dayKey: typeof raw?.dayKey === "string" ? raw.dayKey : today,
@@ -144,14 +283,86 @@
     return next;
   }
 
+  function normalizeRateUsage(raw, validGroupIds = null) {
+    const today = getLocalDayKey();
+    const next = {
+      dayKey: typeof raw?.dayKey === "string" ? raw.dayKey : today,
+      secondsByGroupId: {}
+    };
+
+    if (raw?.secondsByGroupId && typeof raw.secondsByGroupId === "object") {
+      for (const [rawGroupId, rawValue] of Object.entries(raw.secondsByGroupId)) {
+        const groupId = normalizeRateLimitGroupId(rawGroupId);
+        if (!groupId) continue;
+        if (validGroupIds && !validGroupIds.has(groupId)) continue;
+
+        const secondsNum = Number(rawValue);
+        if (!Number.isFinite(secondsNum) || secondsNum <= 0) continue;
+        next.secondsByGroupId[groupId] = Math.floor(secondsNum);
+      }
+    }
+
+    if (next.dayKey !== today) {
+      return { dayKey: today, secondsByGroupId: {} };
+    }
+
+    return next;
+  }
+
+  function migrateLegacyRateUsage(legacyUsageRaw, currentSettings) {
+    const legacy = normalizeLegacyRateUsage(legacyUsageRaw);
+    const validGroupIds = new Set(Object.keys(currentSettings.rateLimitGroupsById || {}));
+    const secondsByGroupId = {};
+    const assignments = currentSettings.channelRateLimitGroupByKey || {};
+
+    for (const [key, seconds] of Object.entries(legacy.secondsByKey || {})) {
+      const groupIdCandidate = normalizeRateLimitGroupId(assignments[key]) || DEFAULT_OPEN_GROUP_ID;
+      const groupId = validGroupIds.has(groupIdCandidate) ? groupIdCandidate : DEFAULT_OPEN_GROUP_ID;
+      secondsByGroupId[groupId] = Number(secondsByGroupId[groupId] || 0) + Number(seconds || 0);
+    }
+
+    return normalizeRateUsage({ dayKey: legacy.dayKey, secondsByGroupId }, validGroupIds);
+  }
+
   function normalizeSettings(raw) {
     const merged = { ...DEFAULTS, ...(raw || {}) };
-    merged.version = 3;
+    merged.version = 4;
     merged.channelIds = [...new Set((merged.channelIds || []).map(normalizeChannelId).filter(Boolean))];
     merged.handles = [...new Set((merged.handles || []).map(normalizeHandle).filter(Boolean))];
-    merged.channelRateLimitsMinutesByKey = normalizeRateLimitMap(merged.channelRateLimitsMinutesByKey);
     merged.mode = merged.mode === "lenient" ? "lenient" : "strict";
     merged.whitelistSubscriptionsByDefault = merged.whitelistSubscriptionsByDefault !== false;
+    merged.rateLimitGroupsById = normalizeRateLimitGroups(merged.rateLimitGroupsById);
+
+    const validGroupIds = new Set(Object.keys(merged.rateLimitGroupsById));
+    merged.channelRateLimitGroupByKey = normalizeChannelRateLimitGroupMap(
+      merged.channelRateLimitGroupByKey,
+      validGroupIds
+    );
+
+    const allowedKeys = new Set(getWhitelistRateLimitKeys(merged.channelIds, merged.handles));
+    merged.channelRateLimitGroupByKey = Object.fromEntries(
+      Object.entries(merged.channelRateLimitGroupByKey).filter(([key]) => allowedKeys.has(key))
+    );
+
+    const legacyMap = normalizeRateLimitMap(merged.channelRateLimitsMinutesByKey);
+    if (Object.keys(legacyMap).length > 0) {
+      const migrated = applyLegacyRateLimitGroupAssignments(
+        merged.rateLimitGroupsById,
+        merged.channelRateLimitGroupByKey,
+        legacyMap,
+        allowedKeys
+      );
+      merged.rateLimitGroupsById = migrated.groupsById;
+      merged.channelRateLimitGroupByKey = migrated.groupByKey;
+    }
+
+    for (const key of allowedKeys) {
+      if (!merged.channelRateLimitGroupByKey[key]) {
+        merged.channelRateLimitGroupByKey[key] = DEFAULT_OPEN_GROUP_ID;
+      }
+    }
+
+    delete merged.channelRateLimitsMinutesByKey;
     return merged;
   }
 
@@ -167,8 +378,21 @@
   }
 
   async function loadRateUsage() {
-    const data = await chrome.storage.local.get([RATE_USAGE_KEY]);
-    rateUsage = normalizeRateUsage(data[RATE_USAGE_KEY]);
+    const data = await chrome.storage.local.get([RATE_USAGE_KEY, LEGACY_RATE_USAGE_KEY]);
+    const validGroupIds = new Set(Object.keys(settings.rateLimitGroupsById || getDefaultRateLimitGroups()));
+
+    if (data[RATE_USAGE_KEY] && typeof data[RATE_USAGE_KEY] === "object") {
+      rateUsage = normalizeRateUsage(data[RATE_USAGE_KEY], validGroupIds);
+      return rateUsage;
+    }
+
+    if (data[LEGACY_RATE_USAGE_KEY] && typeof data[LEGACY_RATE_USAGE_KEY] === "object") {
+      rateUsage = migrateLegacyRateUsage(data[LEGACY_RATE_USAGE_KEY], settings);
+      await chrome.storage.local.set({ [RATE_USAGE_KEY]: rateUsage });
+      return rateUsage;
+    }
+
+    rateUsage = normalizeRateUsage(null, validGroupIds);
     return rateUsage;
   }
 
@@ -183,8 +407,8 @@
     const today = getLocalDayKey();
     if (rateUsage.dayKey === today) return;
 
-    rateUsage = { dayKey: today, secondsByKey: {} };
-    exemptPlayback = { videoId: "", channelKey: "" };
+    rateUsage = { dayKey: today, secondsByGroupId: {} };
+    exemptPlayback = { videoId: "", groupId: "" };
     markRateUsageDirty(15);
   }
 
@@ -200,7 +424,7 @@
 
     const payload = {
       dayKey: rateUsage.dayKey,
-      secondsByKey: { ...(rateUsage.secondsByKey || {}) }
+      secondsByGroupId: { ...(rateUsage.secondsByGroupId || {}) }
     };
 
     playbackUsageDirty = false;
@@ -330,28 +554,36 @@
   function resolveRateLimitConfig(identity) {
     if (!identity) return null;
 
+    const groupByKey = settings.channelRateLimitGroupByKey || {};
+    const groupsById = settings.rateLimitGroupsById || getDefaultRateLimitGroups();
+
     const idKey = identity.channelId ? `id:${normalizeChannelId(identity.channelId)}` : "";
-    if (idKey && settings.channelRateLimitsMinutesByKey[idKey]) {
-      return { key: idKey, minutes: settings.channelRateLimitsMinutesByKey[idKey] };
-    }
-
     const handleKey = identity.handle ? `handle:${normalizeHandle(identity.handle)}` : "";
-    if (handleKey && settings.channelRateLimitsMinutesByKey[handleKey]) {
-      return { key: handleKey, minutes: settings.channelRateLimitsMinutesByKey[handleKey] };
+
+    let groupId = "";
+    if (idKey && groupByKey[idKey]) {
+      groupId = normalizeRateLimitGroupId(groupByKey[idKey]);
+    } else if (handleKey && groupByKey[handleKey]) {
+      groupId = normalizeRateLimitGroupId(groupByKey[handleKey]);
     }
 
-    return null;
+    if (!groupId || !groupsById[groupId]) {
+      groupId = DEFAULT_OPEN_GROUP_ID;
+    }
+
+    const group = groupsById[groupId] || { name: "Open", minutes: null };
+    return { groupId, minutes: group.minutes };
   }
 
-  function getUsedSecondsForKey(key) {
+  function getUsedSecondsForGroup(groupId) {
     ensureRateUsageCurrentDay();
-    return Number(rateUsage.secondsByKey?.[key] || 0);
+    return Number(rateUsage.secondsByGroupId?.[groupId] || 0);
   }
 
-  function isCurrentVideoExemptForKey(key) {
-    if (!key) return false;
-    if (!exemptPlayback.videoId || !exemptPlayback.channelKey) return false;
-    if (exemptPlayback.channelKey !== key) return false;
+  function isCurrentVideoExemptForGroup(groupId) {
+    if (!groupId) return false;
+    if (!exemptPlayback.videoId || !exemptPlayback.groupId) return false;
+    if (exemptPlayback.groupId !== groupId) return false;
 
     const currentVideoId = getCurrentVideoIdFromLocation();
     if (!currentVideoId) return false;
@@ -361,13 +593,13 @@
   function isRateLimited(identity, options = {}) {
     const { allowCurrentVideoExempt = false } = options;
     const config = resolveRateLimitConfig(identity);
-    if (!config) return false;
+    if (!config || config.minutes === null) return false;
 
-    const usedSeconds = getUsedSecondsForKey(config.key);
+    const usedSeconds = getUsedSecondsForGroup(config.groupId);
     const limitSeconds = config.minutes * 60;
     if (usedSeconds < limitSeconds) return false;
 
-    if (allowCurrentVideoExempt && isCurrentVideoExemptForKey(config.key)) {
+    if (allowCurrentVideoExempt && isCurrentVideoExemptForGroup(config.groupId)) {
       return false;
     }
 
@@ -1182,33 +1414,33 @@
     return true;
   }
 
-  function setExemptPlaybackForCurrentVideo(channelKey) {
+  function setExemptPlaybackForCurrentVideo(groupId) {
     const videoId = getCurrentVideoIdFromLocation();
-    if (!videoId || !channelKey) return;
-    exemptPlayback = { videoId, channelKey };
+    if (!videoId || !groupId) return;
+    exemptPlayback = { videoId, groupId };
   }
 
   function clearExemptPlaybackIfVideoChanged() {
     if (!exemptPlayback.videoId) return;
     const currentVideoId = getCurrentVideoIdFromLocation();
     if (!currentVideoId || currentVideoId !== exemptPlayback.videoId) {
-      exemptPlayback = { videoId: "", channelKey: "" };
+      exemptPlayback = { videoId: "", groupId: "" };
     }
   }
 
   function addUsageSecondsForConfig(rateConfig, secondsToAdd) {
-    if (!rateConfig || !rateConfig.key || !secondsToAdd) return;
+    if (!rateConfig || !rateConfig.groupId || !secondsToAdd || rateConfig.minutes === null) return;
     ensureRateUsageCurrentDay();
 
     const limitSeconds = rateConfig.minutes * 60;
-    const before = getUsedSecondsForKey(rateConfig.key);
+    const before = getUsedSecondsForGroup(rateConfig.groupId);
     const after = before + secondsToAdd;
 
-    rateUsage.secondsByKey[rateConfig.key] = after;
+    rateUsage.secondsByGroupId[rateConfig.groupId] = after;
     markRateUsageDirty(secondsToAdd);
 
     if (before < limitSeconds && after >= limitSeconds) {
-      setExemptPlaybackForCurrentVideo(rateConfig.key);
+      setExemptPlaybackForCurrentVideo(rateConfig.groupId);
       applyFiltersForCurrentPage();
     }
   }
@@ -1264,7 +1496,7 @@
     if (!identity) return;
 
     const rateConfig = resolveRateLimitConfig(identity);
-    if (!rateConfig) return;
+    if (!rateConfig || rateConfig.minutes === null) return;
 
     playbackCarrySeconds += clampedSeconds;
     const wholeSeconds = Math.floor(playbackCarrySeconds);
@@ -1653,12 +1885,21 @@
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName === "sync" && changes[SETTINGS_KEY]) {
       settings = normalizeSettings(changes[SETTINGS_KEY].newValue);
+      const validGroupIds = new Set(Object.keys(settings.rateLimitGroupsById || {}));
+      rateUsage = normalizeRateUsage(rateUsage, validGroupIds);
       onRouteChange();
       return;
     }
 
     if (areaName === "local" && changes[RATE_USAGE_KEY]) {
-      rateUsage = normalizeRateUsage(changes[RATE_USAGE_KEY].newValue);
+      const validGroupIds = new Set(Object.keys(settings.rateLimitGroupsById || {}));
+      rateUsage = normalizeRateUsage(changes[RATE_USAGE_KEY].newValue, validGroupIds);
+      applyFiltersForCurrentPage();
+      return;
+    }
+
+    if (areaName === "local" && changes[LEGACY_RATE_USAGE_KEY] && !changes[RATE_USAGE_KEY]) {
+      rateUsage = migrateLegacyRateUsage(changes[LEGACY_RATE_USAGE_KEY].newValue, settings);
       applyFiltersForCurrentPage();
     }
   });
@@ -1673,7 +1914,8 @@
       redirectToSubscriptions();
       return;
     }
-    await Promise.all([loadSettings(), loadRateUsage()]);
+    await loadSettings();
+    await loadRateUsage();
 
     if (shouldBlockByPath()) {
       redirectToSubscriptions();

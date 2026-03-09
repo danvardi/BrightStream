@@ -68,7 +68,8 @@ select {
   background: #fff;
 }
 
-.options input[type="number"] {
+.options input[type="number"],
+.options input[type="text"] {
   width: 100%;
   box-sizing: border-box;
   padding: 8px;
@@ -89,7 +90,8 @@ select {
   font-size: 13px;
 }
 
-#rateLimitsTable {
+#rateLimitsTable,
+#rateLimitGroupsTable {
   width: 100%;
   border-collapse: collapse;
   background: #fff;
@@ -99,13 +101,16 @@ select {
 }
 
 #rateLimitsTable th,
-#rateLimitsTable td {
+#rateLimitsTable td,
+#rateLimitGroupsTable th,
+#rateLimitGroupsTable td {
   border-bottom: 1px solid #eee;
   padding: 8px;
   text-align: left;
 }
 
-#rateLimitsTable tr:last-child td {
+#rateLimitsTable tr:last-child td,
+#rateLimitGroupsTable tr:last-child td {
   border-bottom: none;
 }
 
@@ -129,4 +134,3 @@ select {
 [data-sub-status="error"] {
   color: #b00020;
 }
-

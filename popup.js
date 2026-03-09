@@ -1,11 +1,20 @@
 (() => {
   const SETTINGS_KEY = "ytWhitelistSettings";
+  const DEFAULT_OPEN_GROUP_ID = "open";
+  const DEFAULT_RATE_LIMIT_GROUPS = Object.freeze({
+    open: Object.freeze({ name: "Open", minutes: null }),
+    "30min": Object.freeze({ name: "30 min", minutes: 30 }),
+    "60min": Object.freeze({ name: "60 min", minutes: 60 })
+  });
+  const RESERVED_GROUP_IDS = new Set(Object.keys(DEFAULT_RATE_LIMIT_GROUPS));
+
   const DEFAULTS = {
-    version: 3,
+    version: 4,
     mode: "strict",
     channelIds: [],
     handles: [],
-    channelRateLimitsMinutesByKey: {},
+    rateLimitGroupsById: {},
+    channelRateLimitGroupByKey: {},
     blockShorts: true,
     enforceWatchGuard: true,
     whitelistSubscriptionsByDefault: true,
@@ -52,7 +61,34 @@
     return "";
   }
 
+  function toRateKeyFromChannelId(channelId) {
+    const normalized = normalizeChannelId(channelId);
+    return normalized ? `id:${normalized}` : "";
+  }
+
+  function toRateKeyFromHandle(handle) {
+    const normalized = normalizeHandle(handle);
+    return normalized ? `handle:${normalized}` : "";
+  }
+
+  function getWhitelistRateLimitKeys(channelIds, handles) {
+    const keys = [];
+
+    for (const channelId of channelIds || []) {
+      const key = toRateKeyFromChannelId(channelId);
+      if (key) keys.push(key);
+    }
+
+    for (const handle of handles || []) {
+      const key = toRateKeyFromHandle(handle);
+      if (key) keys.push(key);
+    }
+
+    return [...new Set(keys)];
+  }
+
   function normalizeRateLimitMinutes(value) {
+    if (value === null) return null;
     const num = Number(value);
     if (!Number.isFinite(num)) return null;
 
@@ -74,25 +110,149 @@
     return normalized;
   }
 
+  function normalizeRateLimitGroupId(value) {
+    if (!value) return "";
+    return String(value)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/[^a-z0-9_-]/g, "");
+  }
+
+  function normalizeGroupName(value, fallbackMinutes = null) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (text) return text;
+    if (fallbackMinutes === null) return "Open";
+    return `${fallbackMinutes} min`;
+  }
+
+  function getDefaultRateLimitGroups() {
+    return {
+      open: { name: DEFAULT_RATE_LIMIT_GROUPS.open.name, minutes: null },
+      "30min": { name: DEFAULT_RATE_LIMIT_GROUPS["30min"].name, minutes: 30 },
+      "60min": { name: DEFAULT_RATE_LIMIT_GROUPS["60min"].name, minutes: 60 }
+    };
+  }
+
+  function normalizeRateLimitGroups(raw) {
+    const normalized = getDefaultRateLimitGroups();
+    if (!raw || typeof raw !== "object") return normalized;
+
+    for (const [rawGroupId, rawGroup] of Object.entries(raw)) {
+      const groupId = normalizeRateLimitGroupId(rawGroupId);
+      if (!groupId || RESERVED_GROUP_IDS.has(groupId)) continue;
+      if (!rawGroup || typeof rawGroup !== "object") continue;
+
+      const minutes = normalizeRateLimitMinutes(rawGroup.minutes);
+      if (minutes === null && rawGroup.minutes !== null) continue;
+
+      normalized[groupId] = {
+        name: normalizeGroupName(rawGroup.name, minutes),
+        minutes
+      };
+    }
+
+    return normalized;
+  }
+
+  function normalizeChannelRateLimitGroupMap(raw, validGroupIds) {
+    if (!raw || typeof raw !== "object") return {};
+    const normalized = {};
+
+    for (const [rawKey, rawGroupId] of Object.entries(raw)) {
+      const key = normalizeRateLimitKey(rawKey);
+      const groupId = normalizeRateLimitGroupId(rawGroupId);
+      if (!key || !groupId) continue;
+      if (validGroupIds && !validGroupIds.has(groupId)) continue;
+      normalized[key] = groupId;
+    }
+
+    return normalized;
+  }
+
+  function findGroupIdByMinutes(groupsById, minutes) {
+    for (const [groupId, group] of Object.entries(groupsById || {})) {
+      if (group && group.minutes === minutes) {
+        return groupId;
+      }
+    }
+    return "";
+  }
+
+  function makeUniqueCustomGroupId(baseId, groupsById) {
+    const normalizedBase = normalizeRateLimitGroupId(baseId) || "group";
+    if (!groupsById[normalizedBase]) return normalizedBase;
+
+    let suffix = 2;
+    while (groupsById[`${normalizedBase}-${suffix}`]) {
+      suffix += 1;
+    }
+    return `${normalizedBase}-${suffix}`;
+  }
+
+  function applyLegacyRateLimitGroupAssignments(groupsById, groupByKey, legacyLimitMap, allowedKeys) {
+    const nextGroupsById = { ...(groupsById || {}) };
+    const nextGroupByKey = { ...(groupByKey || {}) };
+
+    for (const [key, minutes] of Object.entries(legacyLimitMap || {})) {
+      if (allowedKeys && !allowedKeys.has(key)) continue;
+      if (nextGroupByKey[key]) continue;
+
+      let groupId = findGroupIdByMinutes(nextGroupsById, minutes);
+      if (!groupId) {
+        const baseId = `${minutes}min`;
+        groupId = makeUniqueCustomGroupId(baseId, nextGroupsById);
+        nextGroupsById[groupId] = {
+          name: `${minutes} min`,
+          minutes
+        };
+      }
+      nextGroupByKey[key] = groupId;
+    }
+
+    return { groupsById: nextGroupsById, groupByKey: nextGroupByKey };
+  }
+
   function normalizeSettings(raw) {
     const merged = { ...DEFAULTS, ...(raw || {}) };
-    merged.version = 3;
+    merged.version = 4;
     merged.channelIds = [...new Set((merged.channelIds || []).map(normalizeChannelId).filter(Boolean))];
     merged.handles = [...new Set((merged.handles || []).map(normalizeHandle).filter(Boolean))];
-    merged.channelRateLimitsMinutesByKey = normalizeRateLimitMap(merged.channelRateLimitsMinutesByKey);
     merged.mode = merged.mode === "lenient" ? "lenient" : "strict";
     merged.whitelistSubscriptionsByDefault = merged.whitelistSubscriptionsByDefault !== false;
+    merged.rateLimitGroupsById = normalizeRateLimitGroups(merged.rateLimitGroupsById);
+
+    const validGroupIds = new Set(Object.keys(merged.rateLimitGroupsById));
+    merged.channelRateLimitGroupByKey = normalizeChannelRateLimitGroupMap(
+      merged.channelRateLimitGroupByKey,
+      validGroupIds
+    );
+
+    const allowedKeys = new Set(getWhitelistRateLimitKeys(merged.channelIds, merged.handles));
+    merged.channelRateLimitGroupByKey = Object.fromEntries(
+      Object.entries(merged.channelRateLimitGroupByKey).filter(([key]) => allowedKeys.has(key))
+    );
+
+    const legacyMap = normalizeRateLimitMap(merged.channelRateLimitsMinutesByKey);
+    if (Object.keys(legacyMap).length > 0) {
+      const migrated = applyLegacyRateLimitGroupAssignments(
+        merged.rateLimitGroupsById,
+        merged.channelRateLimitGroupByKey,
+        legacyMap,
+        allowedKeys
+      );
+      merged.rateLimitGroupsById = migrated.groupsById;
+      merged.channelRateLimitGroupByKey = migrated.groupByKey;
+    }
+
+    for (const key of allowedKeys) {
+      if (!merged.channelRateLimitGroupByKey[key]) {
+        merged.channelRateLimitGroupByKey[key] = DEFAULT_OPEN_GROUP_ID;
+      }
+    }
+
+    delete merged.channelRateLimitsMinutesByKey;
     return merged;
-  }
-
-  function toRateKeyFromChannelId(channelId) {
-    const normalized = normalizeChannelId(channelId);
-    return normalized ? `id:${normalized}` : "";
-  }
-
-  function toRateKeyFromHandle(handle) {
-    const normalized = normalizeHandle(handle);
-    return normalized ? `handle:${normalized}` : "";
   }
 
   async function getSettings() {
@@ -199,13 +359,12 @@
       settings.handles = settings.handles.filter((h) => h !== handle);
     }
 
-    const nextRateLimits = { ...(settings.channelRateLimitsMinutesByKey || {}) };
+    const nextAssignments = { ...(settings.channelRateLimitGroupByKey || {}) };
     const idKey = toRateKeyFromChannelId(currentIdentity.channelId || "");
     const handleKey = toRateKeyFromHandle(currentIdentity.handle || "");
-    if (idKey) delete nextRateLimits[idKey];
-    if (handleKey) delete nextRateLimits[handleKey];
-    settings.channelRateLimitsMinutesByKey = nextRateLimits;
-
+    if (idKey) delete nextAssignments[idKey];
+    if (handleKey) delete nextAssignments[handleKey];
+    settings.channelRateLimitGroupByKey = nextAssignments;
     await saveSettings(settings);
     await notifyActiveTabRefresh();
     setMessage("Channel removed from whitelist.");

@@ -44,8 +44,8 @@
     </section>
 
     <section>
-      <label>Per-channel daily limits (minutes)</label>
-      <p class="muted">Leave blank for unlimited. Applies only to currently whitelisted channels.</p>
+      <label>Channel rate limit groups</label>
+      <p class="muted">Assign each whitelisted channel to a group. Limits are shared across all channels in the same group.</p>
       <div class="inline-actions" id="subscriptionActions">
         <button id="refreshSubscriptionStatusBtn" type="button">Refresh subscription statuses</button>
         <button id="subscribeAllBtn" type="button">Subscribe all not subscribed</button>
@@ -55,7 +55,7 @@
         <thead>
           <tr>
             <th>Channel</th>
-            <th>Daily minutes</th>
+            <th>Rate limit group</th>
             <th>Subscription status</th>
             <th>Action</th>
           </tr>
@@ -63,6 +63,25 @@
         <tbody id="rateLimitsBody"></tbody>
       </table>
       <p id="rateLimitsEmpty" class="muted" hidden>No whitelisted channels yet.</p>
+    </section>
+
+    <section>
+      <label>Rate limit groups</label>
+      <p class="muted">Default groups are fixed: Open (unlimited), 30 min, and 60 min. Add custom groups with 1-1440 minutes/day.</p>
+      <div class="inline-actions">
+        <button id="addRateLimitGroupBtn" type="button">Add rate limit group</button>
+      </div>
+      <table id="rateLimitGroupsTable">
+        <thead>
+          <tr>
+            <th>Group name</th>
+            <th>Daily minutes</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="rateLimitGroupsBody"></tbody>
+      </table>
+      <p id="rateLimitGroupsEmpty" class="muted" hidden>No custom groups yet.</p>
     </section>
 
     <section class="inline-actions">
