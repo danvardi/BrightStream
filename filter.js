@@ -722,11 +722,35 @@
       });
   }
 
-  function removeNode(node) {
-    if (!node || !node.isConnected) return;
-    node.remove();
+  function getRemovalTarget(node) {
+    if (!(node instanceof HTMLElement)) return null;
+
+    const tag = node.tagName.toLowerCase();
+    if (tag === "ytd-lockup-view-model" || tag === "yt-lockup-view-model") {
+      const host = node.closest([
+        "ytd-rich-item-renderer",
+        "ytd-video-renderer",
+        "ytd-compact-video-renderer",
+        "ytd-grid-video-renderer",
+        "ytd-playlist-video-renderer",
+        "ytd-compact-radio-renderer",
+        "ytd-compact-playlist-renderer",
+        "ytd-end-screen-video-renderer"
+      ].join(","));
+
+      if (host instanceof HTMLElement) {
+        return host;
+      }
+    }
+
+    return node;
   }
 
+  function removeNode(node) {
+    const target = getRemovalTarget(node);
+    if (!target || !target.isConnected) return;
+    target.remove();
+  }
   function normalizePathname(pathname) {
     return pathname.endsWith("/") && pathname.length > 1 ? pathname.slice(0, -1) : pathname;
   }
@@ -1695,4 +1719,3 @@
     getCurrentPageIdentity
   };
 })();
-
