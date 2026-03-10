@@ -9,6 +9,7 @@ BrightStream is a Manifest V3 Chrome extension that turns YouTube into a whiteli
 - Filters video tiles and recommendations so only whitelisted channels remain.
 - Enforces watch-page guard: blocked channels are redirected away.
 - Supports shared daily watch limits via rate-limit groups (minutes/day), assignable per whitelisted channel.
+- Options page shows daily watch stats per whitelisted channel and aggregated per rate-limit group (today only; Open/Unlimited shows N/A).
 - Popup actions to add/remove the current channel, with best-effort YouTube subscribe when adding.
 - Options page to edit whitelist, import/export JSON, and manage whitelist subscriptions (status, per-channel subscribe, subscribe-all).
 - Legacy JSON imports with per-channel minutes are auto-mapped into rate-limit groups (reuse same-minute group if it exists, otherwise create one).
@@ -52,7 +53,10 @@ Settings are stored in `chrome.storage.sync` under `ytWhitelistSettings`:
 }
 ```
 
-Daily usage counters are stored locally in `chrome.storage.local` under `ytRateUsageDailyV2`:
+Daily usage counters are stored locally in `chrome.storage.local` under:
+
+- `ytRateUsageDailyV2` (rate-limit enforcement, per group)
+- `ytRateUsageByKeyDailyV1` (options stats, per whitelist key)
 
 ```json
 {
@@ -60,6 +64,16 @@ Daily usage counters are stored locally in `chrome.storage.local` under `ytRateU
   "secondsByGroupId": {
     "30min": 1842,
     "5min-kids": 300
+  }
+}
+```
+
+```json
+{
+  "dayKey": "2026-03-07",
+  "secondsByKey": {
+    "id:UCxxxx...": 900,
+    "handle:@channel": 300
   }
 }
 ```

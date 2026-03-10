@@ -1,6 +1,7 @@
 (() => {
   const SETTINGS_KEY = "ytWhitelistSettings";
   const RATE_USAGE_KEY = "ytRateUsageDailyV2";
+  const RATE_USAGE_BY_KEY_KEY = "ytRateUsageByKeyDailyV1";
   const LEGACY_RATE_USAGE_KEY = "ytRateUsageDailyV1";
   const SUBS_URL = "https://www.youtube.com/feed/subscriptions";
   const WATCH_GUARD_HIDE_STYLE_ID = "brightstream-watch-guard-style";
@@ -45,6 +46,7 @@
 
   let settings = { ...DEFAULTS };
   let rateUsage = { dayKey: "", secondsByGroupId: {} };
+  let rateUsageByKey = { dayKey: "", secondsByKey: {} };
   let observer = null;
   let watchGuardTimer = null;
   let watchGuardProbeToken = 0;
@@ -309,6 +311,31 @@
     return next;
   }
 
+  function normalizeRateUsageByKey(raw) {
+    const today = getLocalDayKey();
+    const next = {
+      dayKey: typeof raw?.dayKey === "string" ? raw.dayKey : today,
+      secondsByKey: {}
+    };
+
+    if (raw?.secondsByKey && typeof raw.secondsByKey === "object") {
+      for (const [rawKey, rawValue] of Object.entries(raw.secondsByKey)) {
+        const key = normalizeRateLimitKey(rawKey);
+        if (!key) continue;
+
+        const secondsNum = Number(rawValue);
+        if (!Number.isFinite(secondsNum) || secondsNum <= 0) continue;
+        next.secondsByKey[key] = Math.floor(secondsNum);
+      }
+    }
+
+    if (next.dayKey !== today) {
+      return { dayKey: today, secondsByKey: {} };
+    }
+
+    return next;
+  }
+
   function migrateLegacyRateUsage(legacyUsageRaw, currentSettings) {
     const legacy = normalizeLegacyRateUsage(legacyUsageRaw);
     const validGroupIds = new Set(Object.keys(currentSettings.rateLimitGroupsById || {}));
@@ -378,8 +405,9 @@
   }
 
   async function loadRateUsage() {
-    const data = await chrome.storage.local.get([RATE_USAGE_KEY, LEGACY_RATE_USAGE_KEY]);
+    const data = await chrome.storage.local.get([RATE_USAGE_KEY, RATE_USAGE_BY_KEY_KEY, LEGACY_RATE_USAGE_KEY]);
     const validGroupIds = new Set(Object.keys(settings.rateLimitGroupsById || getDefaultRateLimitGroups()));
+    rateUsageByKey = normalizeRateUsageByKey(data[RATE_USAGE_BY_KEY_KEY]);
 
     if (data[RATE_USAGE_KEY] && typeof data[RATE_USAGE_KEY] === "object") {
       rateUsage = normalizeRateUsage(data[RATE_USAGE_KEY], validGroupIds);
@@ -388,7 +416,10 @@
 
     if (data[LEGACY_RATE_USAGE_KEY] && typeof data[LEGACY_RATE_USAGE_KEY] === "object") {
       rateUsage = migrateLegacyRateUsage(data[LEGACY_RATE_USAGE_KEY], settings);
-      await chrome.storage.local.set({ [RATE_USAGE_KEY]: rateUsage });
+      await chrome.storage.local.set({
+        [RATE_USAGE_KEY]: rateUsage,
+        [RATE_USAGE_BY_KEY_KEY]: rateUsageByKey
+      });
       return rateUsage;
     }
 
@@ -405,10 +436,19 @@
 
   function ensureRateUsageCurrentDay() {
     const today = getLocalDayKey();
-    if (rateUsage.dayKey === today) return;
+    const groupUsageCurrent = rateUsage.dayKey === today;
+    const keyUsageCurrent = rateUsageByKey.dayKey === today;
+    if (groupUsageCurrent && keyUsageCurrent) return;
 
-    rateUsage = { dayKey: today, secondsByGroupId: {} };
-    exemptPlayback = { videoId: "", groupId: "" };
+    if (!groupUsageCurrent) {
+      rateUsage = { dayKey: today, secondsByGroupId: {} };
+      exemptPlayback = { videoId: "", groupId: "" };
+    }
+
+    if (!keyUsageCurrent) {
+      rateUsageByKey = { dayKey: today, secondsByKey: {} };
+    }
+
     markRateUsageDirty(15);
   }
 
@@ -426,11 +466,18 @@
       dayKey: rateUsage.dayKey,
       secondsByGroupId: { ...(rateUsage.secondsByGroupId || {}) }
     };
+    const byKeyPayload = {
+      dayKey: rateUsageByKey.dayKey,
+      secondsByKey: { ...(rateUsageByKey.secondsByKey || {}) }
+    };
 
     playbackUsageDirty = false;
     playbackPendingPersistSeconds = 0;
 
-    rateUsageFlushInFlight = chrome.storage.local.set({ [RATE_USAGE_KEY]: payload })
+    rateUsageFlushInFlight = chrome.storage.local.set({
+      [RATE_USAGE_KEY]: payload,
+      [RATE_USAGE_BY_KEY_KEY]: byKeyPayload
+    })
       .catch((err) => {
         playbackUsageDirty = true;
         log("Rate usage persist failed", err);
@@ -561,10 +608,13 @@
     const handleKey = identity.handle ? `handle:${normalizeHandle(identity.handle)}` : "";
 
     let groupId = "";
+    let matchedKey = "";
     if (idKey && groupByKey[idKey]) {
       groupId = normalizeRateLimitGroupId(groupByKey[idKey]);
+      matchedKey = idKey;
     } else if (handleKey && groupByKey[handleKey]) {
       groupId = normalizeRateLimitGroupId(groupByKey[handleKey]);
+      matchedKey = handleKey;
     }
 
     if (!groupId || !groupsById[groupId]) {
@@ -572,7 +622,7 @@
     }
 
     const group = groupsById[groupId] || { name: "Open", minutes: null };
-    return { groupId, minutes: group.minutes };
+    return { groupId, minutes: group.minutes, matchedKey };
   }
 
   function getUsedSecondsForGroup(groupId) {
@@ -1437,6 +1487,11 @@
     const after = before + secondsToAdd;
 
     rateUsage.secondsByGroupId[rateConfig.groupId] = after;
+    const matchedKey = normalizeRateLimitKey(rateConfig.matchedKey);
+    if (matchedKey) {
+      const keyBefore = Number(rateUsageByKey.secondsByKey?.[matchedKey] || 0);
+      rateUsageByKey.secondsByKey[matchedKey] = keyBefore + secondsToAdd;
+    }
     markRateUsageDirty(secondsToAdd);
 
     if (before < limitSeconds && after >= limitSeconds) {
@@ -1887,19 +1942,30 @@
       settings = normalizeSettings(changes[SETTINGS_KEY].newValue);
       const validGroupIds = new Set(Object.keys(settings.rateLimitGroupsById || {}));
       rateUsage = normalizeRateUsage(rateUsage, validGroupIds);
+      rateUsageByKey = normalizeRateUsageByKey(rateUsageByKey);
       onRouteChange();
       return;
     }
 
-    if (areaName === "local" && changes[RATE_USAGE_KEY]) {
+    if (areaName !== "local") return;
+
+    let shouldApplyFilters = false;
+    if (changes[RATE_USAGE_KEY]) {
       const validGroupIds = new Set(Object.keys(settings.rateLimitGroupsById || {}));
       rateUsage = normalizeRateUsage(changes[RATE_USAGE_KEY].newValue, validGroupIds);
-      applyFiltersForCurrentPage();
-      return;
+      shouldApplyFilters = true;
     }
 
-    if (areaName === "local" && changes[LEGACY_RATE_USAGE_KEY] && !changes[RATE_USAGE_KEY]) {
+    if (changes[RATE_USAGE_BY_KEY_KEY]) {
+      rateUsageByKey = normalizeRateUsageByKey(changes[RATE_USAGE_BY_KEY_KEY].newValue);
+    }
+
+    if (changes[LEGACY_RATE_USAGE_KEY] && !changes[RATE_USAGE_KEY]) {
       rateUsage = migrateLegacyRateUsage(changes[LEGACY_RATE_USAGE_KEY].newValue, settings);
+      shouldApplyFilters = true;
+    }
+
+    if (shouldApplyFilters) {
       applyFiltersForCurrentPage();
     }
   });

@@ -1,5 +1,6 @@
 (() => {
   const SETTINGS_KEY = "ytWhitelistSettings";
+  const RATE_USAGE_BY_KEY_KEY = "ytRateUsageByKeyDailyV1";
   const DEFAULT_OPEN_GROUP_ID = "open";
   const DEFAULT_RATE_LIMIT_GROUPS = Object.freeze({
     open: Object.freeze({ name: "Open", minutes: null }),
@@ -61,6 +62,7 @@
   let subscriptionStatusByKey = {};
   let subscriptionRunInProgress = false;
   let subscriptionCancelRequested = false;
+  let rateUsageByKey = { dayKey: "", secondsByKey: {} };
 
   function normalizeHandle(value) {
     if (!value) return "";
@@ -203,6 +205,109 @@
     }
 
     return [...new Set(keys)];
+  }
+
+  function getLocalDayKey(date = new Date()) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function normalizeRateUsageByKey(raw) {
+    const today = getLocalDayKey();
+    const next = {
+      dayKey: typeof raw?.dayKey === "string" ? raw.dayKey : today,
+      secondsByKey: {}
+    };
+
+    if (raw?.secondsByKey && typeof raw.secondsByKey === "object") {
+      for (const [rawKey, rawValue] of Object.entries(raw.secondsByKey)) {
+        const key = normalizeRateLimitKey(rawKey);
+        if (!key) continue;
+
+        const secondsNum = Number(rawValue);
+        if (!Number.isFinite(secondsNum) || secondsNum <= 0) continue;
+        next.secondsByKey[key] = Math.floor(secondsNum);
+      }
+    }
+
+    if (next.dayKey !== today) {
+      return { dayKey: today, secondsByKey: {} };
+    }
+
+    return next;
+  }
+
+  async function loadRateUsageByKey() {
+    const data = await chrome.storage.local.get([RATE_USAGE_BY_KEY_KEY]);
+    rateUsageByKey = normalizeRateUsageByKey(data[RATE_USAGE_BY_KEY_KEY]);
+    return rateUsageByKey;
+  }
+
+  function formatDuration(secondsValue) {
+    const seconds = Math.max(0, Math.floor(Number(secondsValue) || 0));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainingSeconds = seconds % 60;
+
+    if (hours > 0) {
+      return `${hours}h ${minutes}m`;
+    }
+
+    if (minutes > 0) {
+      return `${minutes}m ${remainingSeconds}s`;
+    }
+
+    return `${remainingSeconds}s`;
+  }
+
+  function resolveAssignedGroupIdForKey(key, assignmentMap, groupsById) {
+    const assignedGroup = normalizeRateLimitGroupId(assignmentMap?.[key]) || DEFAULT_OPEN_GROUP_ID;
+    return groupsById[assignedGroup] ? assignedGroup : DEFAULT_OPEN_GROUP_ID;
+  }
+
+  function isTrackedGroup(groupId, groupsById) {
+    const group = groupsById[groupId];
+    return Boolean(group && group.minutes !== null);
+  }
+
+  function getTrackedSecondsForKey(key) {
+    return Number(rateUsageByKey.secondsByKey?.[key] || 0);
+  }
+
+  function renderWatchStatsFromDraft() {
+    rateUsageByKey = normalizeRateUsageByKey(rateUsageByKey);
+    const groupsById = readRateLimitGroupsFromDom({ strict: false });
+    const assignmentMap = collectRateLimitDraftValues();
+    const totalsByGroupId = {};
+
+    rateLimitsBodyEl.querySelectorAll("[data-watch-seconds-key]").forEach((node) => {
+      const key = normalizeRateLimitKey(node.dataset.watchSecondsKey || "");
+      if (!key) return;
+
+      const groupId = resolveAssignedGroupIdForKey(key, assignmentMap, groupsById);
+      if (!isTrackedGroup(groupId, groupsById)) {
+        node.textContent = "N/A";
+        return;
+      }
+
+      const seconds = getTrackedSecondsForKey(key);
+      totalsByGroupId[groupId] = Number(totalsByGroupId[groupId] || 0) + seconds;
+      node.textContent = formatDuration(seconds);
+    });
+
+    if (!rateLimitGroupsBodyEl) return;
+
+    rateLimitGroupsBodyEl.querySelectorAll("[data-group-watch-seconds-id]").forEach((node) => {
+      const groupId = normalizeRateLimitGroupId(node.dataset.groupWatchSecondsId || "");
+      if (!groupId || !isTrackedGroup(groupId, groupsById)) {
+        node.textContent = "N/A";
+        return;
+      }
+
+      node.textContent = formatDuration(Number(totalsByGroupId[groupId] || 0));
+    });
   }
 
   function labelForRateLimitKey(key) {
@@ -531,6 +636,7 @@
       select.disabled = disabled;
     });
 
+
     if (rateLimitGroupsBodyEl) {
       rateLimitGroupsBodyEl.querySelectorAll("input,button").forEach((node) => {
         node.disabled = disabled;
@@ -578,6 +684,11 @@
         minutesTd.appendChild(minutesInput);
       }
 
+      const usageTd = document.createElement("td");
+      const usageNode = document.createElement("span");
+      usageNode.dataset.groupWatchSecondsId = groupId;
+      usageTd.appendChild(usageNode);
+
       const actionTd = document.createElement("td");
       if (isDefaultGroupId(groupId)) {
         actionTd.textContent = "Default";
@@ -591,6 +702,7 @@
 
       tr.appendChild(nameTd);
       tr.appendChild(minutesTd);
+      tr.appendChild(usageTd);
       tr.appendChild(actionTd);
       rateLimitGroupsBodyEl.appendChild(tr);
     });
@@ -599,6 +711,8 @@
       const hasCustom = Object.keys(groupsById).some((groupId) => !isDefaultGroupId(groupId));
       rateLimitGroupsEmptyEl.hidden = hasCustom;
     }
+
+    renderWatchStatsFromDraft();
   }
 
   function renderRateLimitRows(channelIds, handles, assignmentMap = {}, groupsById = getDefaultRateLimitGroups()) {
@@ -611,6 +725,7 @@
       rateLimitsTableEl.hidden = true;
       rateLimitsEmptyEl.hidden = false;
       renderSubscriptionControls();
+      renderWatchStatsFromDraft();
       return;
     }
 
@@ -636,9 +751,14 @@
         select.appendChild(option);
       });
 
-      const assignedGroup = normalizeRateLimitGroupId(assignmentMap[key]) || DEFAULT_OPEN_GROUP_ID;
-      select.value = groupsById[assignedGroup] ? assignedGroup : DEFAULT_OPEN_GROUP_ID;
+      const assignedGroup = resolveAssignedGroupIdForKey(key, assignmentMap, groupsById);
+      select.value = assignedGroup;
       groupTd.appendChild(select);
+
+      const usageTd = document.createElement("td");
+      const usageNode = document.createElement("span");
+      usageNode.dataset.watchSecondsKey = key;
+      usageTd.appendChild(usageNode);
 
       const statusTd = document.createElement("td");
       const statusNode = document.createElement("span");
@@ -653,6 +773,7 @@
 
       tr.appendChild(labelTd);
       tr.appendChild(groupTd);
+      tr.appendChild(usageTd);
       tr.appendChild(statusTd);
       tr.appendChild(actionTd);
       rateLimitsBodyEl.appendChild(tr);
@@ -661,6 +782,7 @@
     });
 
     renderSubscriptionControls();
+    renderWatchStatsFromDraft();
   }
 
   function rerenderRateLimitsFromDraft() {
@@ -1144,8 +1266,17 @@
     setStatus("Imported and saved.");
   }
 
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local" || !changes[RATE_USAGE_BY_KEY_KEY]) return;
+    rateUsageByKey = normalizeRateUsageByKey(changes[RATE_USAGE_BY_KEY_KEY].newValue);
+    renderWatchStatsFromDraft();
+  });
+
   async function init() {
-    const settings = await getSettings();
+    const [settings] = await Promise.all([
+      getSettings(),
+      loadRateUsageByKey()
+    ]);
     render(settings);
 
     saveBtnEl.addEventListener("click", () => {
@@ -1195,6 +1326,12 @@
       });
     });
 
+
+    rateLimitsBodyEl.addEventListener("change", (event) => {
+      const select = event.target instanceof HTMLElement ? event.target.closest("select[data-channel-key]") : null;
+      if (!(select instanceof HTMLSelectElement)) return;
+      renderWatchStatsFromDraft();
+    });
     if (rateLimitGroupsBodyEl) {
       rateLimitGroupsBodyEl.addEventListener("click", (event) => {
         const button = event.target instanceof HTMLElement ? event.target.closest("button[data-delete-group-id]") : null;
